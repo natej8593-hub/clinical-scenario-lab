@@ -7,7 +7,9 @@ import fitz
 import streamlit as st
 
 AI_SOURCE_MAP_CHARACTER_LIMIT = 300_000
-CHUNK_TARGET_SIZE = 24_000
+CHUNK_TARGET_SIZE = 18_000
+CHUNK_MAX_TOKENS = 4000
+COMBINE_MAX_TOKENS = 6000
 
 CHUNK_SOURCE_MAP_INSTRUCTIONS = """You are organizing one section of nursing study material for an educational simulation program.
 
@@ -114,6 +116,87 @@ Use this structure:
   "excluded_or_not_emphasized": [],
   "uncertainties": []
 }"""
+
+
+def _string_array_schema():
+    return {"type": "array", "items": {"type": "string"}}
+
+
+def _main_topic_schema():
+    string_fields = [
+        "topic",
+        "disease_process",
+    ]
+    array_fields = [
+        "important_findings",
+        "nursing_assessments",
+        "nursing_actions",
+        "emergency_findings",
+        "patient_teaching",
+        "medications_or_treatments",
+        "diagnostics_or_labs",
+        "delegation_or_escalation",
+        "source_evidence",
+    ]
+    properties = {field: {"type": "string"} for field in string_fields}
+    properties.update({field: _string_array_schema() for field in array_fields})
+    return {
+        "type": "object",
+        "properties": properties,
+        "required": string_fields + array_fields,
+        "additionalProperties": False,
+    }
+
+
+# Structured-output schema for a single chunk analysis response. Every
+# property is required and every object forbids additional properties so
+# the API can guarantee a parseable, complete result (see output_config
+# in call_claude).
+CHUNK_RESULT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "source_file": {"type": "string"},
+        "chunk_number": {"type": "integer"},
+        "source_range": {"type": "string"},
+        "main_topics": {"type": "array", "items": _main_topic_schema()},
+        "professor_emphasis": _string_array_schema(),
+        "excluded_or_not_emphasized": _string_array_schema(),
+        "uncertainties": _string_array_schema(),
+    },
+    "required": [
+        "source_file",
+        "chunk_number",
+        "source_range",
+        "main_topics",
+        "professor_emphasis",
+        "excluded_or_not_emphasized",
+        "uncertainties",
+    ],
+    "additionalProperties": False,
+}
+
+# Structured-output schema for the combined master source map.
+MASTER_SOURCE_MAP_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "source_files": _string_array_schema(),
+        "main_topics": {"type": "array", "items": _main_topic_schema()},
+        "professor_emphasis": _string_array_schema(),
+        "excluded_or_not_emphasized": _string_array_schema(),
+        "uncertainties": _string_array_schema(),
+    },
+    "required": [
+        "source_files",
+        "main_topics",
+        "professor_emphasis",
+        "excluded_or_not_emphasized",
+        "uncertainties",
+    ],
+    "additionalProperties": False,
+}
+
+CHUNK_REQUIRED_KEYS = tuple(CHUNK_RESULT_SCHEMA["required"])
+MASTER_REQUIRED_KEYS = tuple(MASTER_SOURCE_MAP_SCHEMA["required"])
 
 
 TOPIC_KEYWORDS = {
@@ -486,14 +569,30 @@ def compute_stage2_categories(padded_second_response):
     ]
 
 
-def parse_json_response(response_text):
-    """Strip stray markdown fences, if any, then parse as JSON."""
-    cleaned = response_text.strip()
-    if cleaned.startswith("```"):
-        cleaned = cleaned.strip("`")
-        if cleaned.lower().startswith("json"):
-            cleaned = cleaned[4:]
-    return json.loads(cleaned.strip())
+def extract_response_text(response):
+    """Return the first text block's text from a Claude response, or None.
+
+    Structured-output responses are expected to hold their JSON directly in
+    a text content block. This does not rely on markdown-fence stripping.
+    """
+    if not response.content:
+        return None
+    for block in response.content:
+        if block.type == "text":
+            return block.text
+    return None
+
+
+def parse_structured_json(response_text, required_keys):
+    """Parse structured-output JSON and confirm the expected keys exist.
+
+    Raises json.JSONDecodeError or ValueError if the response cannot be
+    treated as a complete result for the given schema.
+    """
+    parsed = json.loads(response_text)
+    if not isinstance(parsed, dict) or any(key not in parsed for key in required_keys):
+        raise ValueError("Structured response is missing expected top-level keys.")
+    return parsed
 
 
 def split_long_text(text, target_size):
@@ -667,37 +766,67 @@ def convert_single_chunk_to_master(chunk_result, filename):
     }
 
 
-def call_claude(prompt, max_tokens):
+def call_claude(prompt, max_tokens, schema):
     client = anthropic.Anthropic(api_key=st.secrets["ANTHROPIC_API_KEY"])
-    response = client.messages.create(
+    return client.messages.create(
         model="claude-sonnet-5",
         max_tokens=max_tokens,
+        output_config={"format": {"type": "json_schema", "schema": schema}},
         messages=[{"role": "user", "content": prompt}],
     )
-    return "".join(block.text for block in response.content if block.type == "text")
 
 
 def run_combine_step(chunk_results, filename):
     try:
-        response_text = call_claude(build_combine_prompt(chunk_results), 4000)
-        st.session_state.ai_source_map = parse_json_response(response_text)
-        st.session_state.ai_source_map_error = None
-        st.session_state.ai_error_phase = None
+        response = call_claude(
+            build_combine_prompt(chunk_results), COMBINE_MAX_TOKENS, MASTER_SOURCE_MAP_SCHEMA
+        )
     except anthropic.AuthenticationError:
         st.session_state.ai_source_map_error = "invalid_key"
         st.session_state.ai_error_phase = "combine"
+        return
     except anthropic.PermissionDeniedError:
         st.session_state.ai_source_map_error = "billing"
         st.session_state.ai_error_phase = "combine"
+        return
     except anthropic.RateLimitError:
         st.session_state.ai_source_map_error = "rate_limited"
         st.session_state.ai_error_phase = "combine"
-    except (json.JSONDecodeError, ValueError):
-        st.session_state.ai_source_map_error = "combine_invalid_json"
-        st.session_state.ai_error_phase = "combine"
+        return
     except Exception:
         st.session_state.ai_source_map_error = "combine_other"
         st.session_state.ai_error_phase = "combine"
+        return
+
+    if response.stop_reason == "max_tokens":
+        st.session_state.ai_source_map_error = "combine_max_tokens"
+        st.session_state.ai_error_phase = "combine"
+        return
+    if response.stop_reason == "refusal":
+        st.session_state.ai_source_map_error = "combine_refusal"
+        st.session_state.ai_error_phase = "combine"
+        return
+    if response.stop_reason != "end_turn":
+        st.session_state.ai_source_map_error = "combine_other"
+        st.session_state.ai_error_phase = "combine"
+        return
+
+    response_text = extract_response_text(response)
+    if response_text is None:
+        st.session_state.ai_source_map_error = "combine_unreadable"
+        st.session_state.ai_error_phase = "combine"
+        return
+
+    try:
+        parsed = parse_structured_json(response_text, MASTER_REQUIRED_KEYS)
+    except (json.JSONDecodeError, ValueError):
+        st.session_state.ai_source_map_error = "combine_unreadable"
+        st.session_state.ai_error_phase = "combine"
+        return
+
+    st.session_state.ai_source_map = parsed
+    st.session_state.ai_source_map_error = None
+    st.session_state.ai_error_phase = None
 
 
 def run_chunk_analysis(chunk_plan, filename, start_index):
@@ -713,8 +842,7 @@ def run_chunk_analysis(chunk_plan, filename, start_index):
         prompt = build_chunk_prompt(filename, index + 1, chunk["range"], chunk["text"])
 
         try:
-            response_text = call_claude(prompt, 1800)
-            chunk_results[index] = parse_json_response(response_text)
+            response = call_claude(prompt, CHUNK_MAX_TOKENS, CHUNK_RESULT_SCHEMA)
         except anthropic.AuthenticationError:
             st.session_state.ai_source_map_error = "invalid_key"
             st.session_state.ai_error_phase = "chunk"
@@ -727,12 +855,34 @@ def run_chunk_analysis(chunk_plan, filename, start_index):
             st.session_state.ai_source_map_error = "rate_limited"
             st.session_state.ai_error_phase = "chunk"
             return
-        except (json.JSONDecodeError, ValueError):
-            st.session_state.ai_source_map_error = "invalid_json_chunk"
-            st.session_state.ai_error_phase = "chunk"
-            return
         except Exception:
             st.session_state.ai_source_map_error = "chunk_other"
+            st.session_state.ai_error_phase = "chunk"
+            return
+
+        if response.stop_reason == "max_tokens":
+            st.session_state.ai_source_map_error = "chunk_max_tokens"
+            st.session_state.ai_error_phase = "chunk"
+            return
+        if response.stop_reason == "refusal":
+            st.session_state.ai_source_map_error = "chunk_refusal"
+            st.session_state.ai_error_phase = "chunk"
+            return
+        if response.stop_reason != "end_turn":
+            st.session_state.ai_source_map_error = "chunk_other"
+            st.session_state.ai_error_phase = "chunk"
+            return
+
+        response_text = extract_response_text(response)
+        if response_text is None:
+            st.session_state.ai_source_map_error = "chunk_unreadable"
+            st.session_state.ai_error_phase = "chunk"
+            return
+
+        try:
+            chunk_results[index] = parse_structured_json(response_text, CHUNK_REQUIRED_KEYS)
+        except (json.JSONDecodeError, ValueError):
+            st.session_state.ai_source_map_error = "chunk_unreadable"
             st.session_state.ai_error_phase = "chunk"
             return
 
@@ -760,17 +910,35 @@ AI_SOURCE_MAP_ERROR_MESSAGES = {
         "The Claude API is temporarily rate limited. Please wait and "
         "resume the analysis."
     ),
-    "invalid_json_chunk": (
-        "Claude responded, but that section could not be read. The "
-        "completed sections were preserved. Try resuming the analysis."
+    "chunk_max_tokens": (
+        "Claude reached the output limit while analyzing this section. "
+        "The completed sections were preserved. Resume after increasing "
+        "the output limit or reducing the section size."
+    ),
+    "chunk_refusal": (
+        "Claude could not analyze this section. The completed sections "
+        "were preserved."
+    ),
+    "chunk_unreadable": (
+        "Claude returned an incomplete or unreadable section result. No "
+        "additional request was made. Completed sections were preserved."
     ),
     "chunk_other": (
         "The AI analysis could not continue. Completed sections were "
         "preserved when possible."
     ),
-    "combine_invalid_json": (
-        "The document sections were analyzed, but the final source map "
-        "could not be combined. Retry the combining step."
+    "combine_max_tokens": (
+        "Claude reached the output limit while combining the section "
+        "results. The completed sections were preserved. Resume after "
+        "increasing the output limit or reducing the section size."
+    ),
+    "combine_refusal": (
+        "Claude could not combine the section results. The completed "
+        "sections were preserved."
+    ),
+    "combine_unreadable": (
+        "Claude returned an incomplete or unreadable section result. No "
+        "additional request was made. Completed sections were preserved."
     ),
     "combine_other": (
         "The AI analysis could not continue. Completed sections were "
@@ -1085,7 +1253,12 @@ else:
                     st.write(
                         f"{completed_count} of {num_chunks} sections completed."
                     )
-                    if st.button("Resume AI Analysis"):
+                    retry_label = (
+                        "Try Section Again"
+                        if completed_count == 0
+                        else "Resume AI Analysis"
+                    )
+                    if st.button(retry_label):
                         run_chunk_analysis(
                             chunk_plan, study_file.name, completed_count
                         )
