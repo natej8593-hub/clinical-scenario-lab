@@ -1,6 +1,81 @@
+import hashlib
 import re
 
 import streamlit as st
+
+
+TOPIC_KEYWORDS = {
+    "Hypertension": [
+        "hypertension",
+        "high blood pressure",
+        "antihypertensive",
+        "blood pressure",
+    ],
+    "Hypertensive Emergency": [
+        "hypertensive emergency",
+        "hypertensive crisis",
+        "target-organ damage",
+        "target organ damage",
+        "blood pressure above 180/120",
+        "180/120",
+    ],
+    "Stroke": [
+        "stroke",
+        "cerebrovascular accident",
+        "CVA",
+        "TIA",
+        "facial droop",
+        "unilateral weakness",
+        "slurred speech",
+        "last known well",
+    ],
+    "Peripheral Arterial Disease": [
+        "peripheral arterial disease",
+        "PAD",
+        "arterial insufficiency",
+        "intermittent claudication",
+        "rest pain",
+        "dependent rubor",
+        "six Ps",
+        "6 Ps",
+    ],
+    "Deep Vein Thrombosis": [
+        "deep vein thrombosis",
+        "DVT",
+        "venous thrombosis",
+        "Virchow",
+        "unilateral edema",
+        "calf tenderness",
+    ],
+    "Anticoagulation": [
+        "heparin",
+        "enoxaparin",
+        "Lovenox",
+        "warfarin",
+        "Coumadin",
+        "anticoagulant",
+        "INR",
+        "aPTT",
+        "anti-Xa",
+        "protamine",
+    ],
+    "Atherosclerosis and Coronary Artery Disease": [
+        "atherosclerosis",
+        "arteriosclerosis",
+        "coronary artery disease",
+        "CAD",
+        "plaque",
+        "atheroma",
+        "HDL",
+        "LDL",
+        "cholesterol",
+    ],
+}
+
+# These short abbreviations are also ordinary words or letter sequences
+# (e.g. "pad", "cadence"), so they only count as a match when they appear
+# in the original text as an uppercase, standalone token.
+UPPERCASE_TOKEN_KEYWORDS = {"PAD", "CAD", "DVT", "TIA", "CVA", "INR", "HDL", "LDL"}
 
 
 def normalize_response_text(text):
@@ -17,6 +92,49 @@ def has_phrase(padded_text, phrase):
 
 def has_any_phrase(padded_text, phrases):
     return any(has_phrase(padded_text, phrase) for phrase in phrases)
+
+
+def detect_study_topics(text):
+    """Scan text for whole-word keyword matches and group results by topic.
+
+    Full medical words and phrases match case-insensitively. Short
+    abbreviations that double as ordinary words (see
+    UPPERCASE_TOKEN_KEYWORDS) only match when they appear as an
+    uppercase, standalone token in the original text.
+    """
+    results = []
+
+    for topic_name, keywords in TOPIC_KEYWORDS.items():
+        matched_keywords = []
+        total_matches = 0
+        matched_spans = []
+
+        for keyword in keywords:
+            case_sensitive = keyword in UPPERCASE_TOKEN_KEYWORDS
+            pattern = r"\b" + re.escape(keyword) + r"\b"
+            flags = 0 if case_sensitive else re.IGNORECASE
+
+            keyword_match_count = 0
+            for match in re.finditer(pattern, text, flags=flags):
+                start, end = match.span()
+                overlaps_existing = any(
+                    start < existing_end and end > existing_start
+                    for existing_start, existing_end in matched_spans
+                )
+                if overlaps_existing:
+                    continue
+                matched_spans.append((start, end))
+                keyword_match_count += 1
+
+            if keyword_match_count > 0:
+                total_matches += keyword_match_count
+                matched_keywords.append(keyword)
+
+        if total_matches > 0:
+            results.append((topic_name, total_matches, matched_keywords))
+
+    results.sort(key=lambda result: result[1], reverse=True)
+    return results
 
 
 def compute_stage1_categories(padded_response):
@@ -273,9 +391,19 @@ st.write(
 study_file = st.file_uploader("Choose a TXT study file", type=["txt"])
 
 if study_file is None:
+    st.session_state.pop("study_analysis_results", None)
+    st.session_state.pop("study_analysis_file_id", None)
     st.write("No study file uploaded yet.")
 else:
     study_file_bytes = study_file.getvalue()
+
+    current_study_file_id = (
+        f"{study_file.name}:{len(study_file_bytes)}:"
+        f"{hashlib.md5(study_file_bytes).hexdigest()}"
+    )
+    if st.session_state.get("study_analysis_file_id") != current_study_file_id:
+        st.session_state.study_analysis_results = None
+        st.session_state.study_analysis_file_id = current_study_file_id
 
     if len(study_file_bytes) == 0:
         st.write("This TXT file is empty. Please upload a file containing study material.")
@@ -301,6 +429,34 @@ else:
                     st.write(
                         "Preview shortened. The complete text remains available "
                         "during this session."
+                    )
+
+            st.subheader("Study Topic Detection")
+
+            if st.button("Analyze Uploaded Notes"):
+                st.session_state.study_analysis_results = detect_study_topics(
+                    study_file_text
+                )
+
+            if st.session_state.get("study_analysis_results") is not None:
+                detected_topics = st.session_state.study_analysis_results
+
+                if detected_topics:
+                    for topic_name, match_count, _ in detected_topics:
+                        st.write(f"✅ {topic_name} — {match_count} matches")
+                    st.write(
+                        "Detected topics are based on simple keyword matching. "
+                        "AI-based understanding will be added later."
+                    )
+                    with st.expander("View matched terms"):
+                        for topic_name, _, matched_keywords in detected_topics:
+                            st.write(f"**{topic_name}**")
+                            for keyword in matched_keywords:
+                                st.write(f"- {keyword}")
+                else:
+                    st.write(
+                        "No supported nursing topics were detected in this TXT "
+                        "file yet."
                     )
 
 st.write(
