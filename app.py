@@ -9,7 +9,6 @@ import streamlit as st
 AI_SOURCE_MAP_CHARACTER_LIMIT = 300_000
 CHUNK_TARGET_SIZE = 12_000
 CHUNK_MAX_TOKENS = 8000
-COMBINE_MAX_TOKENS = 12000
 
 CHUNK_SOURCE_MAP_INSTRUCTIONS = """You are organizing one section of nursing study material for an educational simulation program.
 
@@ -84,49 +83,6 @@ Use exactly this structure:
 }
 
 Keep the output concise and grounded in the supplied section."""
-
-COMBINE_SOURCE_MAP_INSTRUCTIONS = """Combine these section-level nursing source maps into one complete master source map.
-
-Use only information contained in the supplied section maps.
-
-Do not add new medical facts.
-
-Remove duplicate findings while preserving distinct information.
-
-Keep differences when two sections genuinely provide different details.
-
-Preserve filenames and page references.
-
-Never invent a page number.
-
-Place conflicting or uncertain information under uncertainties.
-
-Return valid JSON only, with no markdown fences or introductory text.
-
-Use this structure:
-
-{
-  "source_files": ["filename"],
-  "main_topics": [
-    {
-      "topic": "topic name",
-      "disease_process": "combined source-grounded explanation",
-      "important_findings": ["finding"],
-      "nursing_assessments": ["assessment"],
-      "nursing_actions": ["action"],
-      "emergency_findings": ["finding"],
-      "patient_teaching": ["teaching point"],
-      "medications_or_treatments": ["item"],
-      "diagnostics_or_labs": ["item"],
-      "delegation_or_escalation": ["item"],
-      "source_evidence": ["supporting statement with source page when available"]
-    }
-  ],
-  "professor_emphasis": [],
-  "excluded_or_not_emphasized": [],
-  "uncertainties": []
-}"""
-
 
 def _string_array_schema():
     return {"type": "array", "items": {"type": "string"}}
@@ -759,20 +715,135 @@ def build_chunk_prompt(filename, chunk_number, source_range, chunk_text):
     )
 
 
-def build_combine_prompt(chunk_results):
-    return (
-        f"{COMBINE_SOURCE_MAP_INSTRUCTIONS}\n\n"
-        f"Section source maps:\n{json.dumps(chunk_results)}"
-    )
+MASTER_LIST_FIELDS = (
+    "important_findings",
+    "nursing_assessments",
+    "nursing_actions",
+    "emergency_findings",
+    "patient_teaching",
+    "medications_or_treatments",
+    "diagnostics_or_labs",
+    "delegation_or_escalation",
+    "source_evidence",
+)
+
+# A small set of medical abbreviation/full-name pairs that should always
+# group into a single topic. Keys and values are already normalized
+# (lowercase, punctuation-stripped) forms.
+TOPIC_SYNONYMS = {
+    "pad": "peripheral arterial disease",
+    "peripheral arterial disease": "peripheral arterial disease",
+    "dvt": "deep vein thrombosis",
+    "deep vein thrombosis": "deep vein thrombosis",
+    "cad": "coronary artery disease",
+    "coronary artery disease": "coronary artery disease",
+}
 
 
-def convert_single_chunk_to_master(chunk_result, filename):
+def normalize_topic_key(topic_name):
+    """Normalize a topic name into a stable grouping key for local merging."""
+    key = (topic_name or "").lower()
+    key = re.sub(r"[^\w\s]", " ", key)
+    key = re.sub(r"\s+", " ", key).strip()
+    return TOPIC_SYNONYMS.get(key, key)
+
+
+def dedupe_preserve_order(items):
+    """Remove exact and capitalization-only duplicates, keeping first-seen order."""
+    seen = set()
+    deduped = []
+    for item in items:
+        marker = item.strip().lower()
+        if marker in seen:
+            continue
+        seen.add(marker)
+        deduped.append(item)
+    return deduped
+
+
+def merge_chunk_source_maps(chunk_results, source_filename):
+    """Deterministically combine completed chunk source maps in Python.
+
+    This replaces the removed final Claude "combining" request: every
+    completed chunk map is already source-grounded structured JSON, so no
+    additional model call is needed to merge them.
+    """
+    source_files = []
+    for chunk_result in chunk_results:
+        chunk_filename = chunk_result.get("source_file") or source_filename
+        if chunk_filename not in source_files:
+            source_files.append(chunk_filename)
+    if not source_files:
+        source_files = [source_filename]
+
+    topic_order = []
+    topics_by_key = {}
+
+    for chunk_result in chunk_results:
+        for topic in chunk_result.get("main_topics", []) or []:
+            key = normalize_topic_key(topic.get("topic", ""))
+            if key not in topics_by_key:
+                topics_by_key[key] = {
+                    "topic": topic.get("topic", ""),
+                    "disease_process": [],
+                    **{field: [] for field in MASTER_LIST_FIELDS},
+                }
+                topic_order.append(key)
+            merged_topic = topics_by_key[key]
+
+            disease_process = (topic.get("disease_process") or "").strip()
+            if disease_process:
+                merged_topic["disease_process"].append(disease_process)
+
+            for field in MASTER_LIST_FIELDS:
+                merged_topic[field].extend(topic.get(field) or [])
+
+    main_topics = []
+    for key in topic_order:
+        merged_topic = topics_by_key[key]
+        combined_topic = {
+            "topic": merged_topic["topic"],
+            "disease_process": " ".join(
+                dedupe_preserve_order(merged_topic["disease_process"])
+            ),
+        }
+        for field in MASTER_LIST_FIELDS:
+            combined_topic[field] = dedupe_preserve_order(merged_topic[field])
+        main_topics.append(combined_topic)
+
+    def merge_global_field(field_name):
+        items = [
+            item
+            for chunk_result in chunk_results
+            for item in (chunk_result.get(field_name) or [])
+        ]
+        return dedupe_preserve_order(items)
+
     return {
-        "source_files": [filename],
-        "main_topics": chunk_result.get("main_topics", []),
-        "professor_emphasis": chunk_result.get("professor_emphasis", []),
-        "excluded_or_not_emphasized": chunk_result.get("excluded_or_not_emphasized", []),
-        "uncertainties": chunk_result.get("uncertainties", []),
+        "source_files": source_files,
+        "main_topics": main_topics,
+        "professor_emphasis": merge_global_field("professor_emphasis"),
+        "excluded_or_not_emphasized": merge_global_field("excluded_or_not_emphasized"),
+        "uncertainties": merge_global_field("uncertainties"),
+    }
+
+
+def build_completed_sections_payload(chunk_results, num_chunks, source_filename):
+    """Build the downloadable JSON payload for completed (paid) chunk results.
+
+    Lets a user preserve completed sections before a refresh or restart
+    without contacting Claude.
+    """
+    completed_chunk_numbers = [
+        index + 1 for index, result in enumerate(chunk_results) if result is not None
+    ]
+    return {
+        "source_filename": source_filename,
+        "total_planned_chunks": num_chunks,
+        "completed_chunk_numbers": completed_chunk_numbers,
+        "completed_chunk_results": [
+            result for result in chunk_results if result is not None
+        ],
     }
 
 
@@ -788,59 +859,6 @@ def call_claude(prompt, max_tokens, schema):
         output_config={"format": {"type": "json_schema", "schema": schema}},
         messages=[{"role": "user", "content": prompt}],
     )
-
-
-def run_combine_step(chunk_results, filename):
-    try:
-        response = call_claude(
-            build_combine_prompt(chunk_results), COMBINE_MAX_TOKENS, MASTER_SOURCE_MAP_SCHEMA
-        )
-    except anthropic.AuthenticationError:
-        st.session_state.ai_source_map_error = "invalid_key"
-        st.session_state.ai_error_phase = "combine"
-        return
-    except anthropic.PermissionDeniedError:
-        st.session_state.ai_source_map_error = "billing"
-        st.session_state.ai_error_phase = "combine"
-        return
-    except anthropic.RateLimitError:
-        st.session_state.ai_source_map_error = "rate_limited"
-        st.session_state.ai_error_phase = "combine"
-        return
-    except Exception:
-        st.session_state.ai_source_map_error = "combine_other"
-        st.session_state.ai_error_phase = "combine"
-        return
-
-    if response.stop_reason == "max_tokens":
-        st.session_state.ai_source_map_error = "combine_max_tokens"
-        st.session_state.ai_error_phase = "combine"
-        return
-    if response.stop_reason == "refusal":
-        st.session_state.ai_source_map_error = "combine_refusal"
-        st.session_state.ai_error_phase = "combine"
-        return
-    if response.stop_reason != "end_turn":
-        st.session_state.ai_source_map_error = "combine_other"
-        st.session_state.ai_error_phase = "combine"
-        return
-
-    response_text = extract_response_text(response)
-    if response_text is None:
-        st.session_state.ai_source_map_error = "combine_unreadable"
-        st.session_state.ai_error_phase = "combine"
-        return
-
-    try:
-        parsed = parse_structured_json(response_text, MASTER_REQUIRED_KEYS)
-    except (json.JSONDecodeError, ValueError):
-        st.session_state.ai_source_map_error = "combine_unreadable"
-        st.session_state.ai_error_phase = "combine"
-        return
-
-    st.session_state.ai_source_map = parsed
-    st.session_state.ai_source_map_error = None
-    st.session_state.ai_error_phase = None
 
 
 def run_chunk_analysis(chunk_plan, filename, start_index):
@@ -905,13 +923,8 @@ def run_chunk_analysis(chunk_plan, filename, start_index):
     st.session_state.ai_source_map_error = None
     st.session_state.ai_error_phase = None
 
-    if num_chunks == 1:
-        st.session_state.ai_source_map = convert_single_chunk_to_master(
-            chunk_results[0], filename
-        )
-    else:
-        status_placeholder.write("Combining the section results...")
-        run_combine_step(chunk_results, filename)
+    status_placeholder.write("Combining the section results locally...")
+    st.session_state.ai_source_map = merge_chunk_source_maps(chunk_results, filename)
 
 
 AI_SOURCE_MAP_ERROR_MESSAGES = {
@@ -940,24 +953,17 @@ AI_SOURCE_MAP_ERROR_MESSAGES = {
         "The AI analysis could not continue. Completed sections were "
         "preserved when possible."
     ),
-    "combine_max_tokens": (
-        "Claude reached the output limit while combining the section "
-        "results. No automatic retry was made. Completed sections were "
-        "preserved."
-    ),
-    "combine_refusal": (
-        "Claude could not combine the section results. The completed "
-        "sections were preserved."
-    ),
-    "combine_unreadable": (
-        "Claude returned an incomplete or unreadable section result. No "
-        "additional request was made. Completed sections were preserved."
-    ),
-    "combine_other": (
-        "The AI analysis could not continue. Completed sections were "
-        "preserved when possible."
-    ),
 }
+
+# Legacy error codes from a previous architecture that made a paid Claude
+# request to combine completed chunk results. Combining is now done
+# locally in Python and can no longer fail this way, but a session left
+# running across the deploy of this change could still hold one of these
+# values in st.session_state; kept only so old state can be recognized
+# and cleared automatically (see the backward-compatible cleanup below).
+LEGACY_COMBINE_ERROR_CODES = frozenset(
+    {"combine_max_tokens", "combine_refusal", "combine_unreadable", "combine_other"}
+)
 
 
 st.title("Clinical Scenario Lab")
@@ -1208,9 +1214,11 @@ else:
 
             st.write(
                 "Claude can build a complete AI source map from this "
-                "document by dividing it into sections, analyzing each "
-                "section, and combining the results. Nothing is sent to "
-                "Claude until you confirm and click the button below."
+                "document by dividing it into sections and analyzing each "
+                "section. The completed sections are then combined into "
+                "one master source map locally in Python, with no "
+                "additional Claude request. Nothing is sent to Claude "
+                "until you confirm and click the button below."
             )
 
             st.info(
@@ -1228,8 +1236,11 @@ else:
             else:
                 chunk_plan = chunk_study_text(study_file_text, file_extension)
                 num_chunks = len(chunk_plan)
-                planned_requests = num_chunks + (1 if num_chunks > 1 else 0)
+                planned_requests = num_chunks
                 word_count = len(study_file_text.split())
+                safe_stem = re.sub(
+                    r"[^A-Za-z0-9_-]+", "_", study_file.name.rsplit(".", 1)[0]
+                )
 
                 st.write(
                     f"Extracted material size: {len(study_file_text)} "
@@ -1238,9 +1249,20 @@ else:
                 st.write(f"Planned document sections: {num_chunks}")
                 st.write(f"Planned Claude API requests: {planned_requests}")
                 st.write(
+                    "The completed section maps will be combined locally "
+                    "without an additional Claude API request."
+                )
+                st.write(
                     "Creating a complete source map will use API credit. "
                     "No request will be made until you confirm and click "
                     "the button."
+                )
+                st.write(
+                    "Uploading uses no API credit. Keyword detection uses "
+                    "no API credit. Checking the confirmation box uses no "
+                    "API credit. Each document section requires one "
+                    "deliberate Claude request. Local combining, viewing, "
+                    "expanding, and downloading use no API credit."
                 )
 
                 confirm_checked = st.checkbox(
@@ -1265,6 +1287,30 @@ else:
                 ai_source_map_error = st.session_state.get("ai_source_map_error")
                 ai_error_phase = st.session_state.get("ai_error_phase")
 
+                # Backward-compatible support for a session that completed
+                # every chunk under the previous architecture and then hit
+                # the now-removed paid combining request. Those six (or
+                # more) completed chunk results are still fully usable, so
+                # assemble the master source map locally instead of
+                # requiring a "Retry Combining Step" that no longer exists.
+                has_legacy_combine_error = (
+                    ai_error_phase == "combine"
+                    or ai_source_map_error in LEGACY_COMBINE_ERROR_CODES
+                )
+                if (
+                    st.session_state.get("ai_source_map") is None
+                    and num_chunks > 0
+                    and completed_count == num_chunks
+                    and has_legacy_combine_error
+                ):
+                    st.session_state.ai_source_map = merge_chunk_source_maps(
+                        chunk_results, study_file.name
+                    )
+                    st.session_state.ai_source_map_error = None
+                    st.session_state.ai_error_phase = None
+                    ai_source_map_error = None
+                    ai_error_phase = None
+
                 if ai_source_map_error:
                     st.error(AI_SOURCE_MAP_ERROR_MESSAGES[ai_source_map_error])
 
@@ -1281,15 +1327,28 @@ else:
                         run_chunk_analysis(
                             chunk_plan, study_file.name, completed_count
                         )
-                elif ai_error_phase == "combine":
-                    st.write(f"All {num_chunks} sections completed.")
-                    if st.button("Retry Combining Step"):
-                        run_combine_step(chunk_results, study_file.name)
+
+                if completed_count > 0:
+                    completed_sections_payload = build_completed_sections_payload(
+                        chunk_results, num_chunks, study_file.name
+                    )
+                    st.download_button(
+                        "Download Completed Section Maps JSON",
+                        data=json.dumps(completed_sections_payload, indent=2),
+                        file_name=f"{safe_stem}_completed_sections.json",
+                        mime="application/json",
+                        key="download_completed_sections",
+                    )
 
                 source_map = st.session_state.get("ai_source_map")
 
                 if source_map is not None:
                     st.success("Complete AI source map created successfully.")
+                    st.write(
+                        "The document sections were combined locally. No "
+                        "additional Claude API request was used for the "
+                        "final source map."
+                    )
                     st.write(f"Source file: {study_file.name}")
                     st.write(f"Sections analyzed: {num_chunks}")
                     st.write(
@@ -1344,9 +1403,10 @@ else:
                                 st.write("None identified from this study material.")
 
                     st.write(
-                        "Claude analyzed the uploaded material in sections "
-                        "and combined the results. Review the source map "
-                        "before using it to generate patient scenarios."
+                        "Claude analyzed the uploaded material in sections. "
+                        "The section results were combined locally without "
+                        "an additional Claude request. Review the source "
+                        "map before using it to generate patient scenarios."
                     )
                     st.write(
                         "Viewing, expanding, downloading, or using a "
@@ -1354,7 +1414,6 @@ else:
                         "use additional API credit."
                     )
 
-                    safe_stem = re.sub(r"[^A-Za-z0-9_-]+", "_", study_file.name.rsplit(".", 1)[0])
                     st.download_button(
                         "Download Source Map JSON",
                         data=json.dumps(source_map, indent=2),
