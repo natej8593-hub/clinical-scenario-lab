@@ -1,6 +1,7 @@
 import hashlib
 import re
 
+import fitz
 import streamlit as st
 
 
@@ -383,12 +384,14 @@ st.write("This program will eventually create interactive nursing patient scenar
 st.header("Upload Study Material")
 
 st.write(
-    "Start by uploading a plain-text nursing note or transcript. The program "
-    "will confirm that it can read the file. PDF, PowerPoint, and Word support "
-    "will be added later."
+    "Upload a TXT nursing note, transcript, or text-based PDF. The program "
+    "will read the material during this session. Scanned PDFs are not "
+    "supported yet."
 )
 
-study_file = st.file_uploader("Choose a TXT study file", type=["txt"])
+study_file = st.file_uploader(
+    "Choose a TXT or PDF study file", type=["txt", "pdf"]
+)
 
 if study_file is None:
     st.session_state.pop("study_analysis_results", None)
@@ -405,92 +408,150 @@ else:
         st.session_state.study_analysis_results = None
         st.session_state.study_analysis_file_id = current_study_file_id
 
-    if len(study_file_bytes) == 0:
-        st.write("This TXT file is empty. Please upload a file containing study material.")
-    else:
-        try:
-            study_file_text = study_file_bytes.decode("utf-8")
-        except UnicodeDecodeError:
-            study_file_text = None
-            st.write(
-                "The file could not be read as plain text. Please upload a "
-                "standard TXT file."
-            )
+    study_file_text = None
+    file_extension = study_file.name.rsplit(".", 1)[-1].lower() if "." in study_file.name else ""
 
-        if study_file_text is not None:
-            st.write("File uploaded successfully.")
-            st.write(f"File name: {study_file.name}")
-            st.write(f"Characters read: {len(study_file_text)}")
-            st.write(f"Words read: {len(study_file_text.split())}")
+    if file_extension == "pdf":
+        if len(study_file_bytes) == 0:
+            st.write("The PDF could not be opened. Please try a valid PDF file.")
+        else:
+            try:
+                pdf_document = fitz.open(stream=study_file_bytes, filetype="pdf")
+            except Exception:
+                pdf_document = None
+                st.write("The PDF could not be opened. Please try a valid PDF file.")
 
-            with st.expander("Preview uploaded text"):
-                st.write(study_file_text[:2000])
-                if len(study_file_text) > 2000:
+            if pdf_document is not None:
+                try:
+                    page_count = pdf_document.page_count
+                    raw_page_texts = [
+                        pdf_document.load_page(page_index).get_text()
+                        for page_index in range(page_count)
+                    ]
+                finally:
+                    pdf_document.close()
+
+                has_any_text = any(text.strip() for text in raw_page_texts)
+
+                if not has_any_text:
                     st.write(
-                        "Preview shortened. The complete text remains available "
-                        "during this session."
+                        "No readable text was found in this PDF. It may be a "
+                        "scanned or image-only document. OCR support will be "
+                        "added later."
+                    )
+                else:
+                    some_pages_missing_text = any(
+                        not text.strip() for text in raw_page_texts
+                    )
+                    study_file_text = "\n\n".join(
+                        f"[Page {page_index + 1}]\n{text.strip()}"
+                        for page_index, text in enumerate(raw_page_texts)
                     )
 
-            st.subheader("Study Topic Detection")
+                    st.write("File uploaded successfully.")
+                    st.write(f"File name: {study_file.name}")
+                    st.write("File type: PDF")
+                    st.write(f"Pages read: {page_count}")
+                    st.write(f"Characters read: {len(study_file_text)}")
+                    st.write(f"Words read: {len(study_file_text.split())}")
 
-            if st.button("Analyze Uploaded Notes"):
-                st.session_state.study_analysis_results = detect_study_topics(
-                    study_file_text
+                    if some_pages_missing_text:
+                        st.write("Some PDF pages did not contain readable text.")
+
+                    with st.expander("Preview uploaded text"):
+                        st.write(study_file_text[:2000])
+                        if len(study_file_text) > 2000:
+                            st.write(
+                                "Preview shortened. The complete extracted text "
+                                "remains available during this session."
+                            )
+    elif file_extension == "txt":
+        if len(study_file_bytes) == 0:
+            st.write("This TXT file is empty. Please upload a file containing study material.")
+        else:
+            try:
+                study_file_text = study_file_bytes.decode("utf-8")
+            except UnicodeDecodeError:
+                study_file_text = None
+                st.write(
+                    "The file could not be read as plain text. Please upload a "
+                    "standard TXT file."
                 )
 
-            if st.session_state.get("study_analysis_results") is not None:
-                detected_topics = st.session_state.study_analysis_results
+            if study_file_text is not None:
+                st.write("File uploaded successfully.")
+                st.write(f"File name: {study_file.name}")
+                st.write(f"Characters read: {len(study_file_text)}")
+                st.write(f"Words read: {len(study_file_text.split())}")
 
-                if detected_topics:
-                    for topic_name, match_count, _ in detected_topics:
-                        st.write(f"✅ {topic_name} — {match_count} matches")
+                with st.expander("Preview uploaded text"):
+                    st.write(study_file_text[:2000])
+                    if len(study_file_text) > 2000:
+                        st.write(
+                            "Preview shortened. The complete text remains available "
+                            "during this session."
+                        )
+
+    if study_file_text is not None:
+        st.subheader("Study Topic Detection")
+
+        if st.button("Analyze Uploaded Notes"):
+            st.session_state.study_analysis_results = detect_study_topics(
+                study_file_text
+            )
+
+        if st.session_state.get("study_analysis_results") is not None:
+            detected_topics = st.session_state.study_analysis_results
+
+            if detected_topics:
+                for topic_name, match_count, _ in detected_topics:
+                    st.write(f"✅ {topic_name} — {match_count} matches")
+                st.write(
+                    "Detected topics are based on simple keyword matching. "
+                    "AI-based understanding will be added later."
+                )
+                with st.expander("View matched terms"):
+                    for topic_name, _, matched_keywords in detected_topics:
+                        st.write(f"**{topic_name}**")
+                        for keyword in matched_keywords:
+                            st.write(f"- {keyword}")
+
+                detected_topic_names = [name for name, _, _ in detected_topics]
+
+                if "Hypertensive Emergency" in detected_topic_names:
+                    st.subheader("Scenario Available From Uploaded Notes")
                     st.write(
-                        "Detected topics are based on simple keyword matching. "
-                        "AI-based understanding will be added later."
+                        "A built-in Hypertensive Emergency scenario is "
+                        "available because this topic was detected in the "
+                        "uploaded study material."
                     )
-                    with st.expander("View matched terms"):
-                        for topic_name, _, matched_keywords in detected_topics:
-                            st.write(f"**{topic_name}**")
-                            for keyword in matched_keywords:
-                                st.write(f"- {keyword}")
-
-                    detected_topic_names = [name for name, _, _ in detected_topics]
-
-                    if "Hypertensive Emergency" in detected_topic_names:
-                        st.subheader("Scenario Available From Uploaded Notes")
-                        st.write(
-                            "A built-in Hypertensive Emergency scenario is "
-                            "available because this topic was detected in the "
-                            "uploaded study material."
-                        )
-                        st.write(
-                            "This scenario is selected from the detected topic. "
-                            "It is not yet generated directly from the contents "
-                            "of the uploaded notes. AI-based scenario "
-                            "generation will be added later."
-                        )
-                        if st.button("Load Detected Scenario"):
-                            st.session_state.topic_select = "Hypertensive Emergency"
-                            st.session_state.scenario_started = True
-                            st.session_state.he_submitted_action = None
-                            st.session_state.he_stage2_active = False
-                            st.session_state.he_submitted_second_action = None
-                            st.session_state.he_show_debrief = False
-                            st.session_state.pop("he_first_action_box", None)
-                            st.session_state.pop("he_second_action_box", None)
-                            st.session_state.he_loaded_from_detection = True
-                            st.session_state.he_detected_source_file = study_file.name
-                    else:
-                        st.write(
-                            "A matching topic was detected, but a complete "
-                            "built-in scenario for that topic has not been "
-                            "added yet."
-                        )
+                    st.write(
+                        "This scenario is selected from the detected topic. "
+                        "It is not yet generated directly from the contents "
+                        "of the uploaded notes. AI-based scenario "
+                        "generation will be added later."
+                    )
+                    if st.button("Load Detected Scenario"):
+                        st.session_state.topic_select = "Hypertensive Emergency"
+                        st.session_state.scenario_started = True
+                        st.session_state.he_submitted_action = None
+                        st.session_state.he_stage2_active = False
+                        st.session_state.he_submitted_second_action = None
+                        st.session_state.he_show_debrief = False
+                        st.session_state.pop("he_first_action_box", None)
+                        st.session_state.pop("he_second_action_box", None)
+                        st.session_state.he_loaded_from_detection = True
+                        st.session_state.he_detected_source_file = study_file.name
                 else:
                     st.write(
-                        "No supported nursing topics were detected in this TXT "
-                        "file yet."
+                        "A matching topic was detected, but a complete "
+                        "built-in scenario for that topic has not been "
+                        "added yet."
                     )
+            else:
+                st.write(
+                    "No supported nursing topics were detected in this file yet."
+                )
 
 st.write(
     "Privacy reminder: Do not upload real patient names, medical record numbers, "
