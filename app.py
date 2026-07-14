@@ -7,9 +7,9 @@ import fitz
 import streamlit as st
 
 AI_SOURCE_MAP_CHARACTER_LIMIT = 300_000
-CHUNK_TARGET_SIZE = 18_000
-CHUNK_MAX_TOKENS = 4000
-COMBINE_MAX_TOKENS = 6000
+CHUNK_TARGET_SIZE = 12_000
+CHUNK_MAX_TOKENS = 8000
+COMBINE_MAX_TOKENS = 12000
 
 CHUNK_SOURCE_MAP_INSTRUCTIONS = """You are organizing one section of nursing study material for an educational simulation program.
 
@@ -44,6 +44,16 @@ Prioritize:
 - Information the source says not to focus on
 
 Place unclear, conflicting, or unsupported information under uncertainties.
+
+Keep the response concise but complete:
+
+- Combine duplicate or nearly identical findings instead of listing them more than once.
+- Use concise phrases rather than long paragraphs.
+- Disease-process explanations should normally be no more than 100 words per topic.
+- Each list item should normally be one short sentence.
+- Do not repeat the same fact under several fields unless it serves a different nursing purpose.
+- Include only information supported by this source section.
+- Preserve important nursing details, emergency findings, medications, diagnostics, teaching, professor emphasis, and page references — do not omit unique clinically important information merely to shorten the response.
 
 Return valid JSON only, with no markdown fences and no introductory text.
 
@@ -767,10 +777,14 @@ def convert_single_chunk_to_master(chunk_result, filename):
 
 
 def call_claude(prompt, max_tokens, schema):
+    # Structured extraction doesn't need adaptive thinking, and thinking
+    # tokens count against max_tokens — disabling it keeps the full budget
+    # available for the JSON response itself.
     client = anthropic.Anthropic(api_key=st.secrets["ANTHROPIC_API_KEY"])
     return client.messages.create(
         model="claude-sonnet-5",
         max_tokens=max_tokens,
+        thinking={"type": "disabled"},
         output_config={"format": {"type": "json_schema", "schema": schema}},
         messages=[{"role": "user", "content": prompt}],
     )
@@ -912,8 +926,7 @@ AI_SOURCE_MAP_ERROR_MESSAGES = {
     ),
     "chunk_max_tokens": (
         "Claude reached the output limit while analyzing this section. "
-        "The completed sections were preserved. Resume after increasing "
-        "the output limit or reducing the section size."
+        "No automatic retry was made. Completed sections were preserved."
     ),
     "chunk_refusal": (
         "Claude could not analyze this section. The completed sections "
@@ -929,8 +942,8 @@ AI_SOURCE_MAP_ERROR_MESSAGES = {
     ),
     "combine_max_tokens": (
         "Claude reached the output limit while combining the section "
-        "results. The completed sections were preserved. Resume after "
-        "increasing the output limit or reducing the section size."
+        "results. No automatic retry was made. Completed sections were "
+        "preserved."
     ),
     "combine_refusal": (
         "Claude could not combine the section results. The completed "
@@ -1198,6 +1211,12 @@ else:
                 "document by dividing it into sections, analyzing each "
                 "section, and combining the results. Nothing is sent to "
                 "Claude until you confirm and click the button below."
+            )
+
+            st.info(
+                "App updates or server restarts may clear unfinished "
+                "analysis progress. Complete and download the source map "
+                "when possible."
             )
 
             if len(study_file_text) > AI_SOURCE_MAP_CHARACTER_LIMIT:
