@@ -165,6 +165,231 @@ CHUNK_REQUIRED_KEYS = tuple(CHUNK_RESULT_SCHEMA["required"])
 MASTER_REQUIRED_KEYS = tuple(MASTER_SOURCE_MAP_SCHEMA["required"])
 
 
+def _critical_action_schema():
+    return {
+        "type": "object",
+        "properties": {
+            "action_id": {"type": "string"},
+            "display_name": {"type": "string"},
+            "match_any_phrases": _string_array_schema(),
+            "match_all_keyword_groups": {
+                "type": "array",
+                "items": _string_array_schema(),
+            },
+            "rationale": {"type": "string"},
+            "source_evidence": _string_array_schema(),
+        },
+        "required": [
+            "action_id",
+            "display_name",
+            "match_any_phrases",
+            "match_all_keyword_groups",
+            "rationale",
+            "source_evidence",
+        ],
+        "additionalProperties": False,
+    }
+
+
+def _unsafe_action_schema():
+    return {
+        "type": "object",
+        "properties": {
+            "action": {"type": "string"},
+            "reason": {"type": "string"},
+        },
+        "required": ["action", "reason"],
+        "additionalProperties": False,
+    }
+
+
+def _scenario_stage_schema():
+    return {
+        "type": "object",
+        "properties": {
+            "stage_number": {"type": "integer"},
+            "heading": {"type": "string"},
+            "patient_information": {"type": "string"},
+            "vital_signs": _string_array_schema(),
+            "assessment_information": _string_array_schema(),
+            "question": {"type": "string"},
+            "critical_actions": {
+                "type": "array",
+                "items": _critical_action_schema(),
+            },
+            "unsafe_actions": {"type": "array", "items": _unsafe_action_schema()},
+            "minimum_actions_to_continue": {"type": "integer"},
+            "patient_update_if_successful": {"type": "string"},
+            "patient_update_if_incomplete": {"type": "string"},
+        },
+        "required": [
+            "stage_number",
+            "heading",
+            "patient_information",
+            "vital_signs",
+            "assessment_information",
+            "question",
+            "critical_actions",
+            "unsafe_actions",
+            "minimum_actions_to_continue",
+            "patient_update_if_successful",
+            "patient_update_if_incomplete",
+        ],
+        "additionalProperties": False,
+    }
+
+
+def _scenario_patient_schema():
+    return {
+        "type": "object",
+        "properties": {
+            "name": {"type": "string"},
+            "age": {"type": "integer"},
+            "sex": {"type": "string"},
+            "relevant_history": _string_array_schema(),
+            "allergies": _string_array_schema(),
+        },
+        "required": ["name", "age", "sex", "relevant_history", "allergies"],
+        "additionalProperties": False,
+    }
+
+
+def _scenario_sbar_schema():
+    return {
+        "type": "object",
+        "properties": {
+            "situation": {"type": "string"},
+            "background": {"type": "string"},
+            "assessment": {"type": "string"},
+            "recommendation": {"type": "string"},
+        },
+        "required": ["situation", "background", "assessment", "recommendation"],
+        "additionalProperties": False,
+    }
+
+
+def _scenario_debrief_schema():
+    return {
+        "type": "object",
+        "properties": {
+            "patient_outcome": {"type": "string"},
+            "why_situation_was_dangerous": {"type": "string"},
+            "key_teaching_points": _string_array_schema(),
+            "sbar": _scenario_sbar_schema(),
+        },
+        "required": [
+            "patient_outcome",
+            "why_situation_was_dangerous",
+            "key_teaching_points",
+            "sbar",
+        ],
+        "additionalProperties": False,
+    }
+
+
+# Structured-output schema for one generated two-stage patient scenario.
+GENERATED_SCENARIO_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "scenario_title": {"type": "string"},
+        "topic": {"type": "string"},
+        "setting": {"type": "string"},
+        "difficulty": {"type": "string"},
+        "source_files": _string_array_schema(),
+        "learning_objectives": _string_array_schema(),
+        "patient": _scenario_patient_schema(),
+        "hidden_condition": {"type": "string"},
+        "stages": {"type": "array", "items": _scenario_stage_schema()},
+        "ideal_nursing_sequence": _string_array_schema(),
+        "debrief": _scenario_debrief_schema(),
+        "uncertainties": _string_array_schema(),
+    },
+    "required": [
+        "scenario_title",
+        "topic",
+        "setting",
+        "difficulty",
+        "source_files",
+        "learning_objectives",
+        "patient",
+        "hidden_condition",
+        "stages",
+        "ideal_nursing_sequence",
+        "debrief",
+        "uncertainties",
+    ],
+    "additionalProperties": False,
+}
+
+GENERATED_SCENARIO_REQUIRED_KEYS = tuple(GENERATED_SCENARIO_SCHEMA["required"])
+
+SCENARIO_MAX_TOKENS = 8000
+
+SCENARIO_SETTINGS = [
+    "Intensive Care Unit",
+    "Emergency Department",
+    "Step-Down Unit",
+    "Medical-Surgical Unit",
+]
+
+SCENARIO_DIFFICULTIES = [
+    "Student Nurse",
+    "New-Graduate RN",
+    "Experienced RN",
+    "ICU RN",
+]
+
+SOURCE_MAP_REQUIRED_KEYS = (
+    "source_files",
+    "main_topics",
+    "professor_emphasis",
+    "excluded_or_not_emphasized",
+    "uncertainties",
+)
+
+SCENARIO_GENERATION_INSTRUCTIONS = """You are creating an educational nursing patient simulation from a reviewed source map.
+
+Use only information contained in the supplied source-map topic and supporting fields.
+
+Do not add medical facts absent from the source map.
+
+Do not invent medication doses, laboratory ranges, page numbers, professor statements, or procedures.
+
+Never cite a page unless that page appears in the supplied source evidence.
+
+Do not make the diagnosis obvious in the first sentence.
+
+Create exactly two stages:
+
+Stage 1:
+- Initial handoff or deterioration
+- Requires assessment, recognition, monitoring, safety, and escalation
+
+Stage 2:
+- A clinically related change or complication
+- Requires reassessment and additional nursing priorities
+
+Keep actions within the selected nursing role and setting.
+
+Allow escalation to the provider, rapid-response team, or emergency protocol when appropriate.
+
+Do not require the user to independently prescribe medications or procedures.
+
+Do not provide a medication dose unless that exact dose appears in the supplied source map.
+
+Make the scenario challenging but solvable from the source map.
+
+For each critical action, create several natural-language phrases and keyword groups so local Python matching can recognize reasonable nursing responses.
+
+Do not include the hidden condition in the visible patient handoff.
+
+Preserve relevant source evidence.
+
+Each stage must contain between 3 and 6 critical nursing actions.
+
+Return valid JSON only, matching the supplied structured-output schema exactly, with exactly two stages."""
+
+
 TOPIC_KEYWORDS = {
     "Hypertension": [
         "hypertension",
@@ -966,6 +1191,404 @@ LEGACY_COMBINE_ERROR_CODES = frozenset(
 )
 
 
+def is_valid_source_map(data):
+    """Validate that data has the shape of a Clinical Scenario Lab source map."""
+    if not isinstance(data, dict):
+        return False
+    if any(key not in data for key in SOURCE_MAP_REQUIRED_KEYS):
+        return False
+    if not isinstance(data["source_files"], list):
+        return False
+    if not isinstance(data["main_topics"], list):
+        return False
+    for topic in data["main_topics"]:
+        if not isinstance(topic, dict) or not isinstance(topic.get("topic"), str):
+            return False
+    for key in ("professor_emphasis", "excluded_or_not_emphasized", "uncertainties"):
+        if not isinstance(data[key], list):
+            return False
+    return True
+
+
+def is_valid_generated_scenario(data):
+    """Validate that data has the shape of a generated patient scenario."""
+    if not isinstance(data, dict):
+        return False
+    if any(key not in data for key in GENERATED_SCENARIO_REQUIRED_KEYS):
+        return False
+
+    patient = data.get("patient")
+    patient_keys = ("name", "age", "sex", "relevant_history", "allergies")
+    if not isinstance(patient, dict) or any(key not in patient for key in patient_keys):
+        return False
+
+    stages = data.get("stages")
+    if not isinstance(stages, list) or len(stages) != 2:
+        return False
+
+    stage_keys = (
+        "stage_number",
+        "heading",
+        "patient_information",
+        "vital_signs",
+        "assessment_information",
+        "question",
+        "critical_actions",
+        "unsafe_actions",
+        "minimum_actions_to_continue",
+        "patient_update_if_successful",
+        "patient_update_if_incomplete",
+    )
+    action_keys = (
+        "action_id",
+        "display_name",
+        "match_any_phrases",
+        "match_all_keyword_groups",
+        "rationale",
+        "source_evidence",
+    )
+    for stage in stages:
+        if not isinstance(stage, dict) or any(key not in stage for key in stage_keys):
+            return False
+        critical_actions = stage.get("critical_actions")
+        if not isinstance(critical_actions, list):
+            return False
+        for action in critical_actions:
+            if not isinstance(action, dict) or any(
+                key not in action for key in action_keys
+            ):
+                return False
+
+    debrief = data.get("debrief")
+    debrief_keys = (
+        "patient_outcome",
+        "why_situation_was_dangerous",
+        "key_teaching_points",
+        "sbar",
+    )
+    if not isinstance(debrief, dict) or any(key not in debrief for key in debrief_keys):
+        return False
+
+    sbar = debrief.get("sbar")
+    sbar_keys = ("situation", "background", "assessment", "recommendation")
+    if not isinstance(sbar, dict) or any(key not in sbar for key in sbar_keys):
+        return False
+
+    return True
+
+
+def compute_json_identity(data):
+    return hashlib.md5(
+        json.dumps(data, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+
+
+def filter_relevant_notes(items, topic_name):
+    """Return items mentioning the topic name, or all items if none mention it.
+
+    professor_emphasis, excluded_or_not_emphasized, and uncertainties are
+    stored as flat lists on the source map rather than per-topic, so this
+    is a best-effort filter rather than a guaranteed per-topic mapping.
+    """
+    topic_key = (topic_name or "").strip().lower()
+    if not topic_key:
+        return list(items)
+    matches = [item for item in items if topic_key in str(item).lower()]
+    return matches if matches else list(items)
+
+
+def build_scenario_generation_prompt(
+    topic_object,
+    professor_emphasis,
+    exclusions,
+    uncertainties,
+    setting,
+    difficulty,
+    source_files,
+):
+    payload = {
+        "topic": topic_object,
+        "professor_emphasis": professor_emphasis,
+        "excluded_or_not_emphasized": exclusions,
+        "uncertainties": uncertainties,
+        "setting": setting,
+        "difficulty": difficulty,
+        "source_files": source_files,
+    }
+    return (
+        f"{SCENARIO_GENERATION_INSTRUCTIONS}\n\n"
+        f"Source map data (JSON):\n{json.dumps(payload, indent=2)}"
+    )
+
+
+SCENARIO_GEN_ERROR_MESSAGES = {
+    "invalid_key": "The API key was rejected. Check Streamlit Secrets.",
+    "billing": (
+        "The Claude API account may not have enough usage credits. Check "
+        "Anthropic Billing."
+    ),
+    "rate_limited": (
+        "The Claude API is temporarily rate limited. Please wait and try again."
+    ),
+    "max_tokens": (
+        "Claude reached the output limit while generating the scenario. No "
+        "automatic retry was made."
+    ),
+    "other": (
+        "The patient scenario could not be generated. No automatic retry was made."
+    ),
+}
+
+
+def reset_generated_scenario_progress():
+    """Clear only the generated scenario's gameplay state.
+
+    The generated scenario itself, the active source map, and the ability
+    to replay are left untouched.
+    """
+    st.session_state.gs_started = False
+    st.session_state.gs_current_stage = 1
+    st.session_state.gs_stage_data = {}
+    st.session_state.gs_show_debrief = False
+    st.session_state.pop("gs_stage1_response_box", None)
+    st.session_state.pop("gs_stage2_response_box", None)
+
+
+def run_scenario_generation(prompt):
+    """Make exactly one Claude request to generate a patient scenario."""
+    try:
+        response = call_claude(prompt, SCENARIO_MAX_TOKENS, GENERATED_SCENARIO_SCHEMA)
+    except anthropic.AuthenticationError:
+        st.session_state.scenario_gen_error = "invalid_key"
+        return
+    except anthropic.PermissionDeniedError:
+        st.session_state.scenario_gen_error = "billing"
+        return
+    except anthropic.RateLimitError:
+        st.session_state.scenario_gen_error = "rate_limited"
+        return
+    except Exception:
+        st.session_state.scenario_gen_error = "other"
+        return
+
+    if response.stop_reason == "max_tokens":
+        st.session_state.scenario_gen_error = "max_tokens"
+        return
+    if response.stop_reason != "end_turn":
+        st.session_state.scenario_gen_error = "other"
+        return
+
+    response_text = extract_response_text(response)
+    if response_text is None:
+        st.session_state.scenario_gen_error = "other"
+        return
+
+    try:
+        parsed_scenario = json.loads(response_text)
+    except json.JSONDecodeError:
+        st.session_state.scenario_gen_error = "other"
+        return
+
+    if not is_valid_generated_scenario(parsed_scenario):
+        st.session_state.scenario_gen_error = "other"
+        return
+
+    st.session_state.scenario_gen_error = None
+    st.session_state.generated_scenario = parsed_scenario
+    reset_generated_scenario_progress()
+
+
+def match_critical_action(padded_response, action):
+    """Recognize a critical action via any phrase or a full keyword group."""
+    phrases = [
+        normalize_response_text(phrase)
+        for phrase in (action.get("match_any_phrases") or [])
+    ]
+    if has_any_phrase(padded_response, phrases):
+        return True
+
+    for group in action.get("match_all_keyword_groups") or []:
+        keywords = [normalize_response_text(keyword) for keyword in group]
+        if keywords and all(has_phrase(padded_response, keyword) for keyword in keywords):
+            return True
+
+    return False
+
+
+def render_generated_scenario_stage(scenario, stage_number):
+    stage = scenario["stages"][stage_number - 1]
+    st.header(stage.get("heading") or f"Stage {stage_number}")
+
+    if stage.get("patient_information"):
+        st.write(stage["patient_information"])
+
+    vital_signs = stage.get("vital_signs") or []
+    if vital_signs:
+        st.subheader("Vital signs")
+        for vital in vital_signs:
+            st.write(f"- {vital}")
+
+    assessment_information = stage.get("assessment_information") or []
+    if assessment_information:
+        st.subheader("Assessment information")
+        for item in assessment_information:
+            st.write(f"- {item}")
+
+    if stage.get("question"):
+        st.write(stage["question"])
+
+    response_key = f"gs_stage{stage_number}_response_box"
+    nursing_response = st.text_area("Type your nursing response", key=response_key)
+
+    if st.button("Submit Nursing Action", key=f"gs_stage{stage_number}_submit"):
+        if nursing_response.strip() == "":
+            st.write("Please enter a response before submitting.")
+        else:
+            normalized_response = normalize_response_text(nursing_response)
+            padded_response = f" {normalized_response} "
+            critical_actions = stage.get("critical_actions") or []
+            recognized = [
+                action
+                for action in critical_actions
+                if match_critical_action(padded_response, action)
+            ]
+            missing = [
+                action for action in critical_actions if action not in recognized
+            ]
+            st.session_state.gs_stage_data[stage_number] = {
+                "response": nursing_response,
+                "recognized": recognized,
+                "missing": missing,
+            }
+
+    stage_data = st.session_state.gs_stage_data.get(stage_number)
+    if stage_data is not None:
+        st.write("Your response:")
+        st.write(stage_data["response"])
+
+        for action in stage_data["recognized"]:
+            st.write(f"✅ {action.get('display_name')}")
+            if action.get("rationale"):
+                st.write(action["rationale"])
+            for evidence in action.get("source_evidence") or []:
+                st.write(f"- {evidence}")
+
+        for action in stage_data["missing"]:
+            st.write(f"⚠️ Consider: {action.get('display_name')}")
+            if action.get("rationale"):
+                st.write(action["rationale"])
+            for evidence in action.get("source_evidence") or []:
+                st.write(f"- {evidence}")
+
+        recognized_count = len(stage_data["recognized"])
+        minimum_needed = stage.get("minimum_actions_to_continue", 1)
+
+        if recognized_count >= minimum_needed:
+            if stage.get("patient_update_if_successful"):
+                st.write(stage["patient_update_if_successful"])
+        else:
+            if stage.get("patient_update_if_incomplete"):
+                st.write(stage["patient_update_if_incomplete"])
+
+        if stage_number < len(scenario["stages"]):
+            if recognized_count >= minimum_needed:
+                if st.button(
+                    "Continue Scenario", key=f"gs_stage{stage_number}_continue"
+                ):
+                    st.session_state.gs_current_stage = stage_number + 1
+        else:
+            if recognized_count >= minimum_needed:
+                if st.button("View Generated Scenario Debrief", key="gs_view_debrief"):
+                    st.session_state.gs_show_debrief = True
+
+
+def render_generated_scenario_debrief(scenario):
+    st.header("Generated Scenario Debrief")
+
+    debrief = scenario.get("debrief") or {}
+
+    st.subheader("Patient Outcome")
+    st.write(debrief.get("patient_outcome") or "")
+
+    stage1_data = st.session_state.gs_stage_data.get(1) or {
+        "recognized": [],
+        "missing": [],
+    }
+    stage2_data = st.session_state.gs_stage_data.get(2) or {
+        "recognized": [],
+        "missing": [],
+    }
+
+    st.subheader("Actions Recognized in Stage 1")
+    for action in stage1_data["recognized"]:
+        st.write(f"✅ {action.get('display_name')}")
+
+    st.subheader("Actions Missed in Stage 1")
+    for action in stage1_data["missing"]:
+        st.write(f"⚠️ {action.get('display_name')}")
+
+    st.subheader("Actions Recognized in Stage 2")
+    for action in stage2_data["recognized"]:
+        st.write(f"✅ {action.get('display_name')}")
+
+    st.subheader("Actions Missed in Stage 2")
+    for action in stage2_data["missing"]:
+        st.write(f"⚠️ {action.get('display_name')}")
+
+    st.subheader("Ideal Nursing Sequence")
+    for step in scenario.get("ideal_nursing_sequence") or []:
+        st.write(f"- {step}")
+
+    st.subheader("Why the Situation Was Dangerous")
+    st.write(debrief.get("why_situation_was_dangerous") or "")
+
+    st.subheader("Key Teaching Points")
+    for point in debrief.get("key_teaching_points") or []:
+        st.write(f"- {point}")
+
+    sbar = debrief.get("sbar") or {}
+    st.subheader("Example SBAR")
+    st.markdown("**Situation:**")
+    st.write(sbar.get("situation") or "")
+    st.markdown("**Background:**")
+    st.write(sbar.get("background") or "")
+    st.markdown("**Assessment:**")
+    st.write(sbar.get("assessment") or "")
+    st.markdown("**Recommendation:**")
+    st.write(sbar.get("recommendation") or "")
+
+    st.subheader("Source Evidence")
+    all_evidence = []
+    for stage in scenario.get("stages") or []:
+        for action in stage.get("critical_actions") or []:
+            for evidence in action.get("source_evidence") or []:
+                if evidence not in all_evidence:
+                    all_evidence.append(evidence)
+    if all_evidence:
+        for evidence in all_evidence:
+            st.write(f"- {evidence}")
+    else:
+        st.write("No source evidence was recorded for this scenario.")
+
+    st.subheader("Uncertainties")
+    scenario_uncertainties = scenario.get("uncertainties") or []
+    if scenario_uncertainties:
+        for item in scenario_uncertainties:
+            st.write(f"- {item}")
+    else:
+        st.write("None identified for this scenario.")
+
+    st.write(
+        "This debrief is for education only. Actual nursing actions must "
+        "follow the patient's condition, provider orders, facility policy, "
+        "emergency protocols, supervision, and legal scope of practice."
+    )
+
+    if st.button("Restart Generated Scenario", key="gs_restart_btn"):
+        reset_generated_scenario_progress()
+        st.rerun()
+
+
 st.title("Clinical Scenario Lab")
 
 st.warning("Educational simulation only. Do not use during actual patient care.")
@@ -1425,6 +2048,253 @@ st.write(
     "Privacy reminder: Do not upload real patient names, medical record numbers, "
     "dates of birth, addresses, or other protected health information."
 )
+
+st.header("Saved Source Map")
+
+st.write(
+    "Upload a previously downloaded source-map JSON file to generate a "
+    "patient scenario without re-analyzing the original document. "
+    "Uploading a saved source map does not contact Claude."
+)
+
+saved_source_map_file = st.file_uploader(
+    "Upload a saved Source Map JSON", type=["json"], key="saved_source_map_uploader"
+)
+
+if saved_source_map_file is not None:
+    saved_source_map_bytes = saved_source_map_file.getvalue()
+    saved_source_map_file_id = (
+        f"{saved_source_map_file.name}:{len(saved_source_map_bytes)}:"
+        f"{hashlib.md5(saved_source_map_bytes).hexdigest()}"
+    )
+
+    if st.session_state.get("saved_source_map_file_id") != saved_source_map_file_id:
+        st.session_state.saved_source_map_file_id = saved_source_map_file_id
+        try:
+            candidate_source_map = json.loads(saved_source_map_bytes.decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            candidate_source_map = None
+
+        if candidate_source_map is not None and is_valid_source_map(candidate_source_map):
+            new_source_map_identity = compute_json_identity(candidate_source_map)
+            if new_source_map_identity != st.session_state.get(
+                "uploaded_source_map_identity"
+            ):
+                st.session_state.generated_scenario = None
+                st.session_state.scenario_gen_error = None
+                reset_generated_scenario_progress()
+            st.session_state.uploaded_source_map = candidate_source_map
+            st.session_state.uploaded_source_map_identity = new_source_map_identity
+            st.session_state.saved_source_map_valid = True
+        else:
+            st.session_state.saved_source_map_valid = False
+
+    if st.session_state.get("saved_source_map_valid") is False:
+        st.error("This file is not a valid Clinical Scenario Lab source map.")
+    elif st.session_state.get("saved_source_map_valid"):
+        st.success("Saved source map uploaded successfully.")
+
+active_source_map = st.session_state.get("ai_source_map") or st.session_state.get(
+    "uploaded_source_map"
+)
+
+if active_source_map is not None:
+    st.header("AI Patient Scenario Generator")
+
+    st.write(
+        "Generating a new scenario uses API credit. After it is generated, "
+        "playing or replaying it does not use additional API credit."
+    )
+
+    st.write("- Creating a new scenario uses one Claude API request.")
+    st.write("- Playing the scenario uses no Claude API requests.")
+    st.write("- Replaying it uses no Claude API requests.")
+    st.write("- Downloading it uses no Claude API requests.")
+    st.write("- Uploading a saved scenario uses no Claude API requests.")
+
+    generator_main_topics = active_source_map.get("main_topics", []) or []
+    generator_topic_names = [
+        map_topic.get("topic", "")
+        for map_topic in generator_main_topics
+        if map_topic.get("topic")
+    ]
+
+    if not generator_topic_names:
+        st.write(
+            "This source map does not contain any topics to generate a "
+            "scenario from."
+        )
+    elif "ANTHROPIC_API_KEY" not in st.secrets:
+        st.write(
+            "Add an Anthropic API key in Streamlit Secrets to generate a scenario."
+        )
+    else:
+        selected_scenario_topic_name = st.selectbox(
+            "Choose a topic from the source map",
+            generator_topic_names,
+            key="scenario_gen_topic",
+        )
+        selected_scenario_setting = st.selectbox(
+            "Choose a clinical setting", SCENARIO_SETTINGS, key="scenario_gen_setting"
+        )
+        selected_scenario_difficulty = st.selectbox(
+            "Choose a difficulty", SCENARIO_DIFFICULTIES, key="scenario_gen_difficulty"
+        )
+
+        scenario_gen_confirm_checked = st.checkbox(
+            "I understand that generating a new scenario uses API credit.",
+            key="scenario_gen_confirm",
+        )
+
+        if st.button(
+            "Generate Patient Scenario",
+            disabled=not scenario_gen_confirm_checked,
+            key="generate_patient_scenario_btn",
+        ):
+            selected_topic_object = next(
+                (
+                    map_topic
+                    for map_topic in generator_main_topics
+                    if map_topic.get("topic") == selected_scenario_topic_name
+                ),
+                None,
+            )
+            relevant_professor_emphasis = filter_relevant_notes(
+                active_source_map.get("professor_emphasis") or [],
+                selected_scenario_topic_name,
+            )
+            relevant_exclusions = filter_relevant_notes(
+                active_source_map.get("excluded_or_not_emphasized") or [],
+                selected_scenario_topic_name,
+            )
+            relevant_uncertainties = filter_relevant_notes(
+                active_source_map.get("uncertainties") or [],
+                selected_scenario_topic_name,
+            )
+            scenario_prompt = build_scenario_generation_prompt(
+                selected_topic_object,
+                relevant_professor_emphasis,
+                relevant_exclusions,
+                relevant_uncertainties,
+                selected_scenario_setting,
+                selected_scenario_difficulty,
+                active_source_map.get("source_files") or [],
+            )
+            with st.spinner("Generating the patient scenario..."):
+                run_scenario_generation(scenario_prompt)
+
+        scenario_gen_error = st.session_state.get("scenario_gen_error")
+        if scenario_gen_error:
+            st.error(SCENARIO_GEN_ERROR_MESSAGES[scenario_gen_error])
+
+        if st.session_state.get("generated_scenario") is not None:
+            st.success("Patient scenario generated successfully.")
+            if not st.session_state.get("gs_started"):
+                if st.button(
+                    "Begin Generated Scenario", key="begin_generated_scenario_btn"
+                ):
+                    st.session_state.gs_started = True
+
+st.subheader("Generated Scenario Files")
+
+st.write(
+    "Downloading a generated scenario uses no Claude API requests. "
+    "Uploading a saved scenario uses no Claude API requests."
+)
+
+if st.session_state.get("generated_scenario") is not None:
+    scenario_for_download = st.session_state.generated_scenario
+    safe_topic_stem = re.sub(
+        r"[^A-Za-z0-9_-]+", "_", scenario_for_download.get("topic") or "scenario"
+    )
+    safe_title_stem = re.sub(
+        r"[^A-Za-z0-9_-]+",
+        "_",
+        scenario_for_download.get("scenario_title") or "scenario",
+    )
+    st.download_button(
+        "Download Generated Scenario JSON",
+        data=json.dumps(scenario_for_download, indent=2),
+        file_name=f"{safe_topic_stem}_{safe_title_stem}_scenario.json",
+        mime="application/json",
+        key="download_generated_scenario",
+    )
+
+saved_scenario_file = st.file_uploader(
+    "Upload a Saved Scenario JSON", type=["json"], key="saved_scenario_uploader"
+)
+
+if saved_scenario_file is not None:
+    saved_scenario_bytes = saved_scenario_file.getvalue()
+    saved_scenario_file_id = (
+        f"{saved_scenario_file.name}:{len(saved_scenario_bytes)}:"
+        f"{hashlib.md5(saved_scenario_bytes).hexdigest()}"
+    )
+
+    if st.session_state.get("saved_scenario_file_id") != saved_scenario_file_id:
+        st.session_state.saved_scenario_file_id = saved_scenario_file_id
+        try:
+            candidate_scenario = json.loads(saved_scenario_bytes.decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            candidate_scenario = None
+
+        if candidate_scenario is not None and is_valid_generated_scenario(
+            candidate_scenario
+        ):
+            st.session_state.generated_scenario = candidate_scenario
+            st.session_state.scenario_gen_error = None
+            reset_generated_scenario_progress()
+            st.session_state.saved_scenario_valid = True
+        else:
+            st.session_state.saved_scenario_valid = False
+
+    if st.session_state.get("saved_scenario_valid") is False:
+        st.error("This file is not a valid Clinical Scenario Lab patient scenario.")
+    elif st.session_state.get("saved_scenario_valid"):
+        st.success("Saved scenario loaded successfully.")
+        if not st.session_state.get("gs_started"):
+            if st.button(
+                "Begin Generated Scenario", key="begin_imported_scenario_btn"
+            ):
+                st.session_state.gs_started = True
+
+if "gs_started" not in st.session_state:
+    st.session_state.gs_started = False
+if "gs_current_stage" not in st.session_state:
+    st.session_state.gs_current_stage = 1
+if "gs_stage_data" not in st.session_state:
+    st.session_state.gs_stage_data = {}
+if "gs_show_debrief" not in st.session_state:
+    st.session_state.gs_show_debrief = False
+
+if st.session_state.gs_started and st.session_state.get("generated_scenario") is not None:
+    generated_scenario = st.session_state.generated_scenario
+
+    st.header(generated_scenario.get("scenario_title") or "Generated Patient Scenario")
+
+    learning_objectives = generated_scenario.get("learning_objectives") or []
+    if learning_objectives:
+        st.subheader("Learning Objectives")
+        for objective in learning_objectives:
+            st.write(f"- {objective}")
+
+    patient = generated_scenario.get("patient") or {}
+    if patient:
+        st.subheader("Patient")
+        patient_line = f"{patient.get('name', '')}, {patient.get('age', '')} {patient.get('sex', '')}"
+        st.write(patient_line)
+        for history_item in patient.get("relevant_history") or []:
+            st.write(f"- {history_item}")
+        allergies = patient.get("allergies") or []
+        st.write(f"Allergies: {', '.join(allergies) if allergies else 'None reported'}")
+
+    render_generated_scenario_stage(generated_scenario, 1)
+
+    if st.session_state.gs_current_stage >= 2:
+        render_generated_scenario_stage(generated_scenario, 2)
+
+    if st.session_state.gs_show_debrief:
+        render_generated_scenario_debrief(generated_scenario)
 
 if "topic_select" not in st.session_state:
     st.session_state.topic_select = "Hypertensive Emergency"
