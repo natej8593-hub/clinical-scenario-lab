@@ -1,4 +1,22 @@
+import re
+
 import streamlit as st
+
+
+def normalize_response_text(text):
+    """Lowercase, strip hyphens/punctuation, and collapse whitespace."""
+    text = text.lower()
+    text = re.sub(r"[^\w\s]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def has_phrase(padded_text, phrase):
+    return f" {phrase} " in padded_text
+
+
+def has_any_phrase(padded_text, phrases):
+    return any(has_phrase(padded_text, phrase) for phrase in phrases)
 
 st.title("Clinical Scenario Lab")
 
@@ -48,66 +66,88 @@ if st.session_state.scenario_started:
 
         if st.session_state.he_submitted_action:
             submitted_action = st.session_state.he_submitted_action
-            response_lower = submitted_action.lower()
+
+            normalized_response = normalize_response_text(submitted_action)
+            padded_response = f" {normalized_response} "
 
             st.write("Your action was recorded.")
             st.write(f"You entered: {submitted_action}")
 
             st.header("Initial Nursing Priorities")
 
+            # Category 1: verify the blood pressure needs a BP term AND a
+            # recheck-style action word, in any order and with any words
+            # between them (e.g. "repeat the blood pressure manually").
+            bp_term_present = has_any_phrase(padded_response, ["blood pressure", "bp"])
+            bp_action_words = ["repeat", "recheck", "retake", "verify", "confirm"]
+            bp_action_present = has_any_phrase(padded_response, bp_action_words)
+            check_again_present = has_phrase(padded_response, "check") and has_phrase(
+                padded_response, "again"
+            )
+            take_again_present = has_phrase(padded_response, "take") and has_phrase(
+                padded_response, "again"
+            )
+            bp_recognized = bp_term_present and (
+                bp_action_present or check_again_present or take_again_present
+            )
+
+            # Category 2: focused neurological assessment.
+            neuro_phrases = [
+                "neurological assessment",
+                "neurologic assessment",
+                "neuro assessment",
+                "neurological check",
+                "neurologic check",
+                "neurological checks",
+                "neurologic checks",
+                "neurological status",
+                "neurologic status",
+                "level of consciousness",
+                "mental status",
+                "check pupils",
+                "assess pupils",
+                "pupils",
+                "assess for stroke",
+                "stroke symptoms",
+            ]
+            neuro_recognized = has_any_phrase(padded_response, neuro_phrases)
+
+            # Category 3: continuous monitoring.
+            monitor_phrases = [
+                "continuous monitoring",
+                "cardiac monitoring",
+                "telemetry",
+                "monitor vital signs",
+                "frequent vital signs",
+                "place on monitor",
+                "on the monitor",
+                "cycle blood pressure",
+                "cycle blood pressures",
+            ]
+            monitor_recognized = has_any_phrase(padded_response, monitor_phrases)
+
+            # Category 4: escalate care, either via "notify/call ... provider"
+            # (any words allowed between them) or any rapid response mention.
+            communication_words = ["notify", "call", "contact", "page", "inform"]
+            recipient_words = ["provider", "physician", "doctor"]
+            communication_present = has_any_phrase(padded_response, communication_words)
+            recipient_present = has_any_phrase(padded_response, recipient_words)
+            escalate_via_provider = communication_present and recipient_present
+            escalate_via_rapid_response = has_any_phrase(
+                padded_response, ["rapid response", "rrt"]
+            )
+            escalate_recognized = escalate_via_provider or escalate_via_rapid_response
+
             priority_categories = [
-                (
-                    "Verify the blood pressure",
-                    [
-                        "repeat blood pressure",
-                        "recheck blood pressure",
-                        "manual blood pressure",
-                        "verify blood pressure",
-                        "take blood pressure again",
-                    ],
-                ),
-                (
-                    "Perform a focused neurological assessment",
-                    [
-                        "neurological assessment",
-                        "neurologic assessment",
-                        "neuro assessment",
-                        "assess mental status",
-                        "assess pupils",
-                        "assess for stroke",
-                        "check level of consciousness",
-                    ],
-                ),
-                (
-                    "Begin continuous monitoring",
-                    [
-                        "continuous monitoring",
-                        "cardiac monitoring",
-                        "telemetry",
-                        "monitor vital signs",
-                        "frequent vital signs",
-                        "place on monitor",
-                    ],
-                ),
-                (
-                    "Escalate care",
-                    [
-                        "notify provider",
-                        "call provider",
-                        "notify physician",
-                        "call physician",
-                        "rapid response",
-                        "activate rrt",
-                        "call rrt",
-                        "escalate care",
-                    ],
-                ),
+                ("Verify the blood pressure", bp_recognized),
+                ("Perform a focused neurological assessment", neuro_recognized),
+                ("Begin continuous monitoring", monitor_recognized),
+                ("Escalate care", escalate_recognized),
             ]
 
             recognized_count = 0
 
-            for category_name, phrases in priority_categories:
-                recognized = any(phrase in response_lower for phrase in phrases)
+            for category_name, recognized in priority_categories:
                 if recognized:
                     recognized_count += 1
                     st.write(f"✅ {category_name}")
