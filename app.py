@@ -72,6 +72,11 @@ TOPIC_KEYWORDS = {
     ],
 }
 
+# These short abbreviations are also ordinary words or letter sequences
+# (e.g. "pad", "cadence"), so they only count as a match when they appear
+# in the original text as an uppercase, standalone token.
+UPPERCASE_TOKEN_KEYWORDS = {"PAD", "CAD", "DVT", "TIA", "CVA", "INR", "HDL", "LDL"}
+
 
 def normalize_response_text(text):
     """Lowercase, strip hyphens/punctuation, and collapse whitespace."""
@@ -90,18 +95,39 @@ def has_any_phrase(padded_text, phrases):
 
 
 def detect_study_topics(text):
-    """Scan text for whole-word keyword matches and group results by topic."""
+    """Scan text for whole-word keyword matches and group results by topic.
+
+    Full medical words and phrases match case-insensitively. Short
+    abbreviations that double as ordinary words (see
+    UPPERCASE_TOKEN_KEYWORDS) only match when they appear as an
+    uppercase, standalone token in the original text.
+    """
     results = []
 
     for topic_name, keywords in TOPIC_KEYWORDS.items():
         matched_keywords = []
         total_matches = 0
+        matched_spans = []
 
         for keyword in keywords:
+            case_sensitive = keyword in UPPERCASE_TOKEN_KEYWORDS
             pattern = r"\b" + re.escape(keyword) + r"\b"
-            match_count = len(re.findall(pattern, text, flags=re.IGNORECASE))
-            if match_count > 0:
-                total_matches += match_count
+            flags = 0 if case_sensitive else re.IGNORECASE
+
+            keyword_match_count = 0
+            for match in re.finditer(pattern, text, flags=flags):
+                start, end = match.span()
+                overlaps_existing = any(
+                    start < existing_end and end > existing_start
+                    for existing_start, existing_end in matched_spans
+                )
+                if overlaps_existing:
+                    continue
+                matched_spans.append((start, end))
+                keyword_match_count += 1
+
+            if keyword_match_count > 0:
+                total_matches += keyword_match_count
                 matched_keywords.append(keyword)
 
         if total_matches > 0:
