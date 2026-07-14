@@ -262,6 +262,52 @@ st.warning("Educational simulation only. Do not use during actual patient care."
 
 st.write("This program will eventually create interactive nursing patient scenarios.")
 
+st.header("Upload Study Material")
+
+st.write(
+    "Start by uploading a plain-text nursing note or transcript. The program "
+    "will confirm that it can read the file. PDF, PowerPoint, and Word support "
+    "will be added later."
+)
+
+study_file = st.file_uploader("Choose a TXT study file", type=["txt"])
+
+if study_file is None:
+    st.write("No study file uploaded yet.")
+else:
+    study_file_bytes = study_file.getvalue()
+
+    if len(study_file_bytes) == 0:
+        st.write("This TXT file is empty. Please upload a file containing study material.")
+    else:
+        try:
+            study_file_text = study_file_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            study_file_text = None
+            st.write(
+                "The file could not be read as plain text. Please upload a "
+                "standard TXT file."
+            )
+
+        if study_file_text is not None:
+            st.write("File uploaded successfully.")
+            st.write(f"File name: {study_file.name}")
+            st.write(f"Characters read: {len(study_file_text)}")
+            st.write(f"Words read: {len(study_file_text.split())}")
+
+            with st.expander("Preview uploaded text"):
+                st.write(study_file_text[:2000])
+                if len(study_file_text) > 2000:
+                    st.write(
+                        "Preview shortened. The complete text remains available "
+                        "during this session."
+                    )
+
+st.write(
+    "Privacy reminder: Do not upload real patient names, medical record numbers, "
+    "dates of birth, addresses, or other protected health information."
+)
+
 topic = st.selectbox(
     "Choose a nursing topic",
     ["Hypertensive Emergency", "Peripheral Arterial Disease", "Deep Vein Thrombosis"],
