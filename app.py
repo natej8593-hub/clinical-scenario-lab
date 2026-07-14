@@ -34,6 +34,11 @@ if "scenario_started" not in st.session_state:
 
 if st.button("Start Scenario"):
     st.session_state.scenario_started = True
+    st.session_state.he_submitted_action = None
+    st.session_state.he_stage2_active = False
+    st.session_state.he_submitted_second_action = None
+    st.session_state.pop("he_first_action_box", None)
+    st.session_state.pop("he_second_action_box", None)
 
 if st.session_state.scenario_started:
     if topic == "Hypertensive Emergency":
@@ -52,10 +57,16 @@ if st.session_state.scenario_started:
 
         st.write("What would you assess or do first?")
 
-        nursing_action = st.text_area("Type your nursing action")
+        nursing_action = st.text_area("Type your nursing action", key="he_first_action_box")
 
         if "he_submitted_action" not in st.session_state:
             st.session_state.he_submitted_action = None
+
+        if "he_stage2_active" not in st.session_state:
+            st.session_state.he_stage2_active = False
+
+        if "he_submitted_second_action" not in st.session_state:
+            st.session_state.he_submitted_second_action = None
 
         if st.button("Submit Action"):
             if nursing_action.strip() == "":
@@ -163,6 +174,45 @@ if st.session_state.scenario_started:
                 "Blood pressure above 180/120 mm Hg with new neurological symptoms "
                 "suggests a hypertensive emergency with possible target-organ damage."
             )
+
+            if recognized_count >= 3:
+                if st.button("Continue Scenario"):
+                    st.session_state.he_stage2_active = True
+
+        if st.session_state.he_stage2_active:
+            st.header("Patient Update — 3 Minutes Later")
+
+            st.write(
+                "The repeat manual blood pressure is 218/124 mm Hg. Mr. Jones is now "
+                "confused and has developed slurred speech, left-sided facial "
+                "drooping, and weakness in his left arm. His oxygen saturation "
+                "remains 96% on room air. His airway is currently open, and he is "
+                "breathing without assistance."
+            )
+
+            st.subheader("Last known well")
+            st.write(
+                "Mr. Jones was speaking normally and moving all extremities "
+                "approximately 10 minutes ago."
+            )
+
+            st.write("What would you assess or do next?")
+
+            second_action = st.text_area(
+                "Type your next nursing action", key="he_second_action_box"
+            )
+
+            if st.button("Submit Next Action"):
+                if second_action.strip() == "":
+                    st.session_state.he_submitted_second_action = None
+                    st.write("Please enter an action before submitting.")
+                else:
+                    st.session_state.he_submitted_second_action = second_action
+
+            if st.session_state.he_submitted_second_action:
+                st.write("Your second action was recorded.")
+                st.write("You entered:")
+                st.write(st.session_state.he_submitted_second_action)
     else:
         st.write(f"You selected: {topic}")
         st.write("The interactive patient scenario for this topic will be added later.")
