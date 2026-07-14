@@ -1,9 +1,50 @@
 import hashlib
+import json
 import re
 
 import anthropic
 import fitz
 import streamlit as st
+
+AI_SOURCE_MAP_CHARACTER_LIMIT = 8000
+
+SOURCE_MAP_INSTRUCTIONS = """You are organizing nursing study material for an educational simulation program.
+
+Use only the supplied study material.
+
+Do not add medical facts that are absent from the supplied material.
+
+Do not invent medication doses, laboratory ranges, page numbers, professor statements, or nursing actions.
+
+If information is unclear or missing, place it under uncertainties.
+
+Return valid JSON only, with no markdown fences and no introductory text.
+
+Use exactly this structure:
+
+{
+  "source_file": "filename",
+  "main_topics": [
+    {
+      "topic": "topic name",
+      "disease_process": "brief explanation supported by the source",
+      "important_findings": ["finding"],
+      "nursing_assessments": ["assessment"],
+      "nursing_actions": ["action"],
+      "emergency_findings": ["finding"],
+      "patient_teaching": ["teaching point"],
+      "medications_or_treatments": ["item"],
+      "source_evidence": ["short supporting statement from the uploaded material"]
+    }
+  ],
+  "professor_emphasis": [],
+  "excluded_or_not_emphasized": [],
+  "uncertainties": []
+}
+
+For a TXT file, do not invent page numbers.
+
+Keep the output concise."""
 
 
 TOPIC_KEYWORDS = {
@@ -376,6 +417,24 @@ def compute_stage2_categories(padded_second_response):
     ]
 
 
+def build_source_map_prompt(filename, text):
+    return (
+        f"{SOURCE_MAP_INSTRUCTIONS}\n\n"
+        f"Uploaded filename: {filename}\n\n"
+        f"Study material:\n{text}"
+    )
+
+
+def parse_source_map_response(response_text):
+    """Strip stray markdown fences, if any, then parse as JSON."""
+    cleaned = response_text.strip()
+    if cleaned.startswith("```"):
+        cleaned = cleaned.strip("`")
+        if cleaned.lower().startswith("json"):
+            cleaned = cleaned[4:]
+    return json.loads(cleaned.strip())
+
+
 st.title("Clinical Scenario Lab")
 
 st.warning("Educational simulation only. Do not use during actual patient care.")
@@ -454,6 +513,8 @@ study_file = st.file_uploader(
 if study_file is None:
     st.session_state.pop("study_analysis_results", None)
     st.session_state.pop("study_analysis_file_id", None)
+    st.session_state.pop("ai_source_map", None)
+    st.session_state.pop("ai_source_map_error", None)
     st.write("No study file uploaded yet.")
 else:
     study_file_bytes = study_file.getvalue()
@@ -465,6 +526,8 @@ else:
     if st.session_state.get("study_analysis_file_id") != current_study_file_id:
         st.session_state.study_analysis_results = None
         st.session_state.study_analysis_file_id = current_study_file_id
+        st.session_state.pop("ai_source_map", None)
+        st.session_state.pop("ai_source_map_error", None)
 
     study_file_text = None
     file_extension = study_file.name.rsplit(".", 1)[-1].lower() if "." in study_file.name else ""
@@ -610,6 +673,147 @@ else:
                 st.write(
                     "No supported nursing topics were detected in this file yet."
                 )
+
+        if "ANTHROPIC_API_KEY" in st.secrets:
+            st.subheader("AI Study Analysis")
+
+            st.write(
+                "Claude will analyze the uploaded study material only when "
+                "you click the button below. This action uses a small "
+                "amount of API credit."
+            )
+
+            if len(study_file_text) > AI_SOURCE_MAP_CHARACTER_LIMIT:
+                st.write(
+                    "This file is too large for the first AI test. Upload "
+                    "a shorter TXT note containing 8,000 characters or "
+                    "fewer. Full chapter analysis will be added after this "
+                    "test works."
+                )
+            else:
+                if st.button("Create AI Source Map"):
+                    with st.spinner("Creating the AI source map..."):
+                        try:
+                            client = anthropic.Anthropic(
+                                api_key=st.secrets["ANTHROPIC_API_KEY"]
+                            )
+                            prompt = build_source_map_prompt(
+                                study_file.name, study_file_text
+                            )
+                            response = client.messages.create(
+                                model="claude-sonnet-5",
+                                max_tokens=1500,
+                                messages=[
+                                    {"role": "user", "content": prompt}
+                                ],
+                            )
+                            response_text = "".join(
+                                block.text
+                                for block in response.content
+                                if block.type == "text"
+                            )
+                            st.session_state.ai_source_map = parse_source_map_response(
+                                response_text
+                            )
+                            st.session_state.ai_source_map_error = None
+                        except anthropic.AuthenticationError:
+                            st.session_state.ai_source_map = None
+                            st.session_state.ai_source_map_error = "invalid_key"
+                        except anthropic.PermissionDeniedError:
+                            st.session_state.ai_source_map = None
+                            st.session_state.ai_source_map_error = "billing"
+                        except anthropic.RateLimitError:
+                            st.session_state.ai_source_map = None
+                            st.session_state.ai_source_map_error = "rate_limited"
+                        except (json.JSONDecodeError, ValueError):
+                            st.session_state.ai_source_map = None
+                            st.session_state.ai_source_map_error = "invalid_json"
+                        except Exception:
+                            st.session_state.ai_source_map = None
+                            st.session_state.ai_source_map_error = "other"
+
+                ai_source_map_error = st.session_state.get("ai_source_map_error")
+
+                if ai_source_map_error == "invalid_key":
+                    st.error("The API key was rejected. Check Streamlit Secrets.")
+                elif ai_source_map_error == "billing":
+                    st.error(
+                        "The Claude API account may not have enough usage "
+                        "credits. Check Anthropic Billing."
+                    )
+                elif ai_source_map_error == "rate_limited":
+                    st.error(
+                        "The Claude API is temporarily rate limited. "
+                        "Please wait and try again."
+                    )
+                elif ai_source_map_error == "invalid_json":
+                    st.error(
+                        "Claude responded, but the source map could not be "
+                        "read. Please try the analysis again."
+                    )
+                elif ai_source_map_error == "other":
+                    st.error(
+                        "The AI source map could not be created. Please "
+                        "try again later."
+                    )
+
+                source_map = st.session_state.get("ai_source_map")
+
+                if source_map is not None:
+                    st.success("AI source map created successfully.")
+                    st.write(f"Source file: {source_map.get('source_file', '')}")
+
+                    for map_topic in source_map.get("main_topics", []) or []:
+                        with st.expander(map_topic.get("topic") or "Untitled topic"):
+                            if map_topic.get("disease_process"):
+                                st.write("**Disease process**")
+                                st.write(map_topic["disease_process"])
+
+                            list_fields = [
+                                ("important_findings", "Important findings"),
+                                ("nursing_assessments", "Nursing assessments"),
+                                ("nursing_actions", "Nursing actions"),
+                                ("emergency_findings", "Emergency findings"),
+                                ("patient_teaching", "Patient teaching"),
+                                (
+                                    "medications_or_treatments",
+                                    "Medications or treatments",
+                                ),
+                                ("source_evidence", "Source evidence"),
+                            ]
+                            for field_key, field_label in list_fields:
+                                field_items = map_topic.get(field_key)
+                                if field_items:
+                                    st.write(f"**{field_label}**")
+                                    for item in field_items:
+                                        st.write(f"- {item}")
+
+                    for field_key, field_label in [
+                        ("professor_emphasis", "Professor emphasis"),
+                        (
+                            "excluded_or_not_emphasized",
+                            "Excluded or not emphasized",
+                        ),
+                        ("uncertainties", "Uncertainties"),
+                    ]:
+                        with st.expander(field_label):
+                            field_items = source_map.get(field_key)
+                            if field_items:
+                                for item in field_items:
+                                    st.write(f"- {item}")
+                            else:
+                                st.write("None identified from this uploaded material.")
+
+                    st.write(
+                        "This source map was generated by Claude from the "
+                        "uploaded material. Review it before using it to "
+                        "build patient scenarios."
+                    )
+                    st.write(
+                        "Creating the source map uses API credit. Viewing "
+                        "it again during this session does not use "
+                        "additional credit."
+                    )
 
 st.write(
     "Privacy reminder: Do not upload real patient names, medical record numbers, "
