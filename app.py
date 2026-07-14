@@ -453,6 +453,39 @@ else:
                             st.write(f"**{topic_name}**")
                             for keyword in matched_keywords:
                                 st.write(f"- {keyword}")
+
+                    detected_topic_names = [name for name, _, _ in detected_topics]
+
+                    if "Hypertensive Emergency" in detected_topic_names:
+                        st.subheader("Scenario Available From Uploaded Notes")
+                        st.write(
+                            "A built-in Hypertensive Emergency scenario is "
+                            "available because this topic was detected in the "
+                            "uploaded study material."
+                        )
+                        st.write(
+                            "This scenario is selected from the detected topic. "
+                            "It is not yet generated directly from the contents "
+                            "of the uploaded notes. AI-based scenario "
+                            "generation will be added later."
+                        )
+                        if st.button("Load Detected Scenario"):
+                            st.session_state.topic_select = "Hypertensive Emergency"
+                            st.session_state.scenario_started = True
+                            st.session_state.he_submitted_action = None
+                            st.session_state.he_stage2_active = False
+                            st.session_state.he_submitted_second_action = None
+                            st.session_state.he_show_debrief = False
+                            st.session_state.pop("he_first_action_box", None)
+                            st.session_state.pop("he_second_action_box", None)
+                            st.session_state.he_loaded_from_detection = True
+                            st.session_state.he_detected_source_file = study_file.name
+                    else:
+                        st.write(
+                            "A matching topic was detected, but a complete "
+                            "built-in scenario for that topic has not been "
+                            "added yet."
+                        )
                 else:
                     st.write(
                         "No supported nursing topics were detected in this TXT "
@@ -464,9 +497,13 @@ st.write(
     "dates of birth, addresses, or other protected health information."
 )
 
+if "topic_select" not in st.session_state:
+    st.session_state.topic_select = "Hypertensive Emergency"
+
 topic = st.selectbox(
     "Choose a nursing topic",
     ["Hypertensive Emergency", "Peripheral Arterial Disease", "Deep Vein Thrombosis"],
+    key="topic_select",
 )
 
 if "scenario_started" not in st.session_state:
@@ -480,9 +517,21 @@ if st.button("Start Scenario"):
     st.session_state.he_show_debrief = False
     st.session_state.pop("he_first_action_box", None)
     st.session_state.pop("he_second_action_box", None)
+    st.session_state.he_loaded_from_detection = False
+    st.session_state.pop("he_detected_source_file", None)
 
 if st.session_state.scenario_started:
     if topic == "Hypertensive Emergency":
+        if st.session_state.get("he_loaded_from_detection") and st.session_state.get(
+            "he_detected_source_file"
+        ):
+            st.write("Source connection:")
+            st.write(
+                "This built-in practice scenario was selected because "
+                "Hypertensive Emergency was detected in "
+                f"{st.session_state.he_detected_source_file}."
+            )
+
         st.header("Patient Handoff")
 
         st.write(
@@ -770,6 +819,8 @@ if st.session_state.scenario_started:
                         st.session_state.he_show_debrief = False
                         st.session_state.pop("he_first_action_box", None)
                         st.session_state.pop("he_second_action_box", None)
+                        st.session_state.he_loaded_from_detection = False
+                        st.session_state.pop("he_detected_source_file", None)
                         st.rerun()
     else:
         st.write(f"You selected: {topic}")
