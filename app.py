@@ -1,6 +1,7 @@
 import hashlib
 import re
 
+import anthropic
 import fitz
 import streamlit as st
 
@@ -378,6 +379,63 @@ def compute_stage2_categories(padded_second_response):
 st.title("Clinical Scenario Lab")
 
 st.warning("Educational simulation only. Do not use during actual patient care.")
+
+st.header("AI Connection")
+
+st.write(
+    "Claude AI is not contacted automatically. API credits are used only "
+    "when an AI button is deliberately clicked."
+)
+
+if st.button("Test AI Connection"):
+    if "ANTHROPIC_API_KEY" not in st.secrets:
+        st.session_state.ai_connection_status = "missing_key"
+    else:
+        try:
+            with st.spinner("Testing the Claude connection..."):
+                client = anthropic.Anthropic(
+                    api_key=st.secrets["ANTHROPIC_API_KEY"]
+                )
+                client.messages.create(
+                    model="claude-sonnet-5",
+                    max_tokens=30,
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": "Reply with exactly: AI connection successful.",
+                        }
+                    ],
+                )
+            st.session_state.ai_connection_status = "success"
+        except anthropic.AuthenticationError:
+            st.session_state.ai_connection_status = "invalid_key"
+        except anthropic.PermissionDeniedError:
+            st.session_state.ai_connection_status = "billing"
+        except anthropic.RateLimitError:
+            st.session_state.ai_connection_status = "rate_limited"
+        except anthropic.APIError:
+            st.session_state.ai_connection_status = "connection_error"
+        except Exception:
+            st.session_state.ai_connection_status = "connection_error"
+
+ai_connection_status = st.session_state.get("ai_connection_status")
+
+if ai_connection_status == "missing_key":
+    st.error("The Anthropic API key was not found in Streamlit Secrets.")
+elif ai_connection_status == "invalid_key":
+    st.error("The API key was rejected. Check the key stored in Streamlit Secrets.")
+elif ai_connection_status == "billing":
+    st.error(
+        "The Claude API account may not have enough usage credits. Check "
+        "Billing in the Anthropic Console."
+    )
+elif ai_connection_status == "rate_limited":
+    st.error("The Claude API is temporarily rate limited. Please wait and try again.")
+elif ai_connection_status == "connection_error":
+    st.error("The AI connection could not be completed. Please try again later.")
+elif ai_connection_status == "success":
+    st.success("AI connection successful.")
+    st.write("No study material was sent during this test.")
 
 st.write("This program will eventually create interactive nursing patient scenarios.")
 
