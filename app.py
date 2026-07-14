@@ -6,17 +6,42 @@ import anthropic
 import fitz
 import streamlit as st
 
-AI_SOURCE_MAP_CHARACTER_LIMIT = 8000
+AI_SOURCE_MAP_CHARACTER_LIMIT = 300_000
+CHUNK_TARGET_SIZE = 24_000
 
-SOURCE_MAP_INSTRUCTIONS = """You are organizing nursing study material for an educational simulation program.
+CHUNK_SOURCE_MAP_INSTRUCTIONS = """You are organizing one section of nursing study material for an educational simulation program.
 
-Use only the supplied study material.
+Use only the supplied source section.
 
-Do not add medical facts that are absent from the supplied material.
+Do not add medical facts that are absent from the source.
 
-Do not invent medication doses, laboratory ranges, page numbers, professor statements, or nursing actions.
+Do not invent medication doses, laboratory ranges, page numbers, professor statements, nursing actions, or patient teaching.
 
-If information is unclear or missing, place it under uncertainties.
+Page markers such as [Page 1], [Page 2], and [Page 3] came from the uploaded PDF.
+
+Never invent a page reference.
+
+Only cite a page when the supporting information appears after that page marker in this source section.
+
+For TXT files, do not invent page numbers.
+
+Prioritize:
+
+- Disease processes
+- Pathophysiology
+- Important assessment findings
+- Emergency findings
+- Nursing assessments
+- Nursing priorities and interventions
+- Medications and treatments
+- Laboratory or diagnostic monitoring
+- Patient teaching
+- Safety precautions
+- Delegation or escalation
+- Professor emphasis
+- Information the source says not to focus on
+
+Place unclear, conflicting, or unsupported information under uncertainties.
 
 Return valid JSON only, with no markdown fences and no introductory text.
 
@@ -24,6 +49,8 @@ Use exactly this structure:
 
 {
   "source_file": "filename",
+  "chunk_number": 1,
+  "source_range": "pages or text section",
   "main_topics": [
     {
       "topic": "topic name",
@@ -34,7 +61,9 @@ Use exactly this structure:
       "emergency_findings": ["finding"],
       "patient_teaching": ["teaching point"],
       "medications_or_treatments": ["item"],
-      "source_evidence": ["short supporting statement from the uploaded material"]
+      "diagnostics_or_labs": ["item"],
+      "delegation_or_escalation": ["item"],
+      "source_evidence": ["short supporting statement with source page when available"]
     }
   ],
   "professor_emphasis": [],
@@ -42,9 +71,49 @@ Use exactly this structure:
   "uncertainties": []
 }
 
-For a TXT file, do not invent page numbers.
+Keep the output concise and grounded in the supplied section."""
 
-Keep the output concise."""
+COMBINE_SOURCE_MAP_INSTRUCTIONS = """Combine these section-level nursing source maps into one complete master source map.
+
+Use only information contained in the supplied section maps.
+
+Do not add new medical facts.
+
+Remove duplicate findings while preserving distinct information.
+
+Keep differences when two sections genuinely provide different details.
+
+Preserve filenames and page references.
+
+Never invent a page number.
+
+Place conflicting or uncertain information under uncertainties.
+
+Return valid JSON only, with no markdown fences or introductory text.
+
+Use this structure:
+
+{
+  "source_files": ["filename"],
+  "main_topics": [
+    {
+      "topic": "topic name",
+      "disease_process": "combined source-grounded explanation",
+      "important_findings": ["finding"],
+      "nursing_assessments": ["assessment"],
+      "nursing_actions": ["action"],
+      "emergency_findings": ["finding"],
+      "patient_teaching": ["teaching point"],
+      "medications_or_treatments": ["item"],
+      "diagnostics_or_labs": ["item"],
+      "delegation_or_escalation": ["item"],
+      "source_evidence": ["supporting statement with source page when available"]
+    }
+  ],
+  "professor_emphasis": [],
+  "excluded_or_not_emphasized": [],
+  "uncertainties": []
+}"""
 
 
 TOPIC_KEYWORDS = {
@@ -417,15 +486,7 @@ def compute_stage2_categories(padded_second_response):
     ]
 
 
-def build_source_map_prompt(filename, text):
-    return (
-        f"{SOURCE_MAP_INSTRUCTIONS}\n\n"
-        f"Uploaded filename: {filename}\n\n"
-        f"Study material:\n{text}"
-    )
-
-
-def parse_source_map_response(response_text):
+def parse_json_response(response_text):
     """Strip stray markdown fences, if any, then parse as JSON."""
     cleaned = response_text.strip()
     if cleaned.startswith("```"):
@@ -433,6 +494,289 @@ def parse_source_map_response(response_text):
         if cleaned.lower().startswith("json"):
             cleaned = cleaned[4:]
     return json.loads(cleaned.strip())
+
+
+def split_long_text(text, target_size):
+    """Split text into pieces near target_size without dropping characters.
+
+    Prefers a paragraph break, then a sentence break, and only falls back
+    to a hard cut when no good break point is found in the second half of
+    the target window.
+    """
+    if len(text) <= target_size:
+        return [text]
+
+    pieces = []
+    remaining = text
+    while len(remaining) > target_size:
+        window = remaining[:target_size]
+        split_at = window.rfind("\n\n")
+        if split_at <= target_size // 2:
+            sentence_split = max(window.rfind(". "), window.rfind(".\n"))
+            split_at = sentence_split + 1 if sentence_split > target_size // 2 else -1
+        else:
+            split_at += 2
+        if split_at <= 0:
+            split_at = target_size
+        pieces.append(remaining[:split_at])
+        remaining = remaining[split_at:]
+    if remaining:
+        pieces.append(remaining)
+    return pieces
+
+
+def chunk_pdf_document(text, target_size):
+    """Divide extracted PDF text into chunks, splitting at page boundaries."""
+    page_pattern = re.compile(r"\[Page (\d+)\]\n")
+    matches = list(page_pattern.finditer(text))
+
+    pages = []
+    for match_index, match in enumerate(matches):
+        page_number = int(match.group(1))
+        start = match.start()
+        end = (
+            matches[match_index + 1].start()
+            if match_index + 1 < len(matches)
+            else len(text)
+        )
+        pages.append((page_number, text[start:end]))
+
+    chunks = []
+    current_pages = []
+    current_length = 0
+
+    def flush():
+        if not current_pages:
+            return
+        page_numbers = [page_number for page_number, _ in current_pages]
+        if len(page_numbers) == 1:
+            range_label = f"Page {page_numbers[0]}"
+        else:
+            range_label = f"Pages {page_numbers[0]}-{page_numbers[-1]}"
+        chunks.append(
+            {
+                "range": range_label,
+                "text": "".join(page_text for _, page_text in current_pages),
+            }
+        )
+
+    for page_number, page_text in pages:
+        if len(page_text) > target_size:
+            flush()
+            current_pages = []
+            current_length = 0
+            pieces = split_long_text(page_text, target_size)
+            for piece_index, piece in enumerate(pieces, start=1):
+                chunks.append(
+                    {
+                        "range": f"Page {page_number} (part {piece_index} of {len(pieces)})",
+                        "text": piece,
+                    }
+                )
+            continue
+
+        if current_length + len(page_text) > target_size and current_pages:
+            flush()
+            current_pages = []
+            current_length = 0
+
+        current_pages.append((page_number, page_text))
+        current_length += len(page_text)
+
+    flush()
+    return chunks
+
+
+def chunk_txt_document(text, target_size):
+    """Divide plain text into chunks, splitting primarily at paragraph breaks."""
+    paragraphs = [
+        paragraph for paragraph in re.split(r"\n\s*\n", text) if paragraph.strip()
+    ]
+
+    chunks = []
+    current_parts = []
+    current_length = 0
+    section_number = 0
+
+    def flush():
+        nonlocal section_number
+        if not current_parts:
+            return
+        section_number += 1
+        chunks.append(
+            {
+                "range": f"Text section {section_number}",
+                "text": "\n\n".join(current_parts),
+            }
+        )
+
+    for paragraph in paragraphs:
+        if len(paragraph) > target_size:
+            flush()
+            current_parts.clear()
+            current_length = 0
+            for piece in split_long_text(paragraph, target_size):
+                section_number += 1
+                chunks.append(
+                    {"range": f"Text section {section_number}", "text": piece}
+                )
+            continue
+
+        if current_length + len(paragraph) > target_size and current_parts:
+            flush()
+            current_parts.clear()
+            current_length = 0
+
+        current_parts.append(paragraph)
+        current_length += len(paragraph)
+
+    flush()
+    return chunks
+
+
+def chunk_study_text(text, file_extension, target_size=CHUNK_TARGET_SIZE):
+    if file_extension == "pdf":
+        return chunk_pdf_document(text, target_size)
+    return chunk_txt_document(text, target_size)
+
+
+def build_chunk_prompt(filename, chunk_number, source_range, chunk_text):
+    return (
+        f"{CHUNK_SOURCE_MAP_INSTRUCTIONS}\n\n"
+        f"Uploaded filename: {filename}\n"
+        f"Chunk number: {chunk_number}\n"
+        f"Source range: {source_range}\n\n"
+        f"Source section text:\n{chunk_text}"
+    )
+
+
+def build_combine_prompt(chunk_results):
+    return (
+        f"{COMBINE_SOURCE_MAP_INSTRUCTIONS}\n\n"
+        f"Section source maps:\n{json.dumps(chunk_results)}"
+    )
+
+
+def convert_single_chunk_to_master(chunk_result, filename):
+    return {
+        "source_files": [filename],
+        "main_topics": chunk_result.get("main_topics", []),
+        "professor_emphasis": chunk_result.get("professor_emphasis", []),
+        "excluded_or_not_emphasized": chunk_result.get("excluded_or_not_emphasized", []),
+        "uncertainties": chunk_result.get("uncertainties", []),
+    }
+
+
+def call_claude(prompt, max_tokens):
+    client = anthropic.Anthropic(api_key=st.secrets["ANTHROPIC_API_KEY"])
+    response = client.messages.create(
+        model="claude-sonnet-5",
+        max_tokens=max_tokens,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    return "".join(block.text for block in response.content if block.type == "text")
+
+
+def run_combine_step(chunk_results, filename):
+    try:
+        response_text = call_claude(build_combine_prompt(chunk_results), 4000)
+        st.session_state.ai_source_map = parse_json_response(response_text)
+        st.session_state.ai_source_map_error = None
+        st.session_state.ai_error_phase = None
+    except anthropic.AuthenticationError:
+        st.session_state.ai_source_map_error = "invalid_key"
+        st.session_state.ai_error_phase = "combine"
+    except anthropic.PermissionDeniedError:
+        st.session_state.ai_source_map_error = "billing"
+        st.session_state.ai_error_phase = "combine"
+    except anthropic.RateLimitError:
+        st.session_state.ai_source_map_error = "rate_limited"
+        st.session_state.ai_error_phase = "combine"
+    except (json.JSONDecodeError, ValueError):
+        st.session_state.ai_source_map_error = "combine_invalid_json"
+        st.session_state.ai_error_phase = "combine"
+    except Exception:
+        st.session_state.ai_source_map_error = "combine_other"
+        st.session_state.ai_error_phase = "combine"
+
+
+def run_chunk_analysis(chunk_plan, filename, start_index):
+    num_chunks = len(chunk_plan)
+    chunk_results = st.session_state.ai_chunk_results
+
+    progress_bar = st.progress(start_index / num_chunks if num_chunks else 0)
+    status_placeholder = st.empty()
+
+    for index in range(start_index, num_chunks):
+        status_placeholder.write(f"Analyzing section {index + 1} of {num_chunks}...")
+        chunk = chunk_plan[index]
+        prompt = build_chunk_prompt(filename, index + 1, chunk["range"], chunk["text"])
+
+        try:
+            response_text = call_claude(prompt, 1800)
+            chunk_results[index] = parse_json_response(response_text)
+        except anthropic.AuthenticationError:
+            st.session_state.ai_source_map_error = "invalid_key"
+            st.session_state.ai_error_phase = "chunk"
+            return
+        except anthropic.PermissionDeniedError:
+            st.session_state.ai_source_map_error = "billing"
+            st.session_state.ai_error_phase = "chunk"
+            return
+        except anthropic.RateLimitError:
+            st.session_state.ai_source_map_error = "rate_limited"
+            st.session_state.ai_error_phase = "chunk"
+            return
+        except (json.JSONDecodeError, ValueError):
+            st.session_state.ai_source_map_error = "invalid_json_chunk"
+            st.session_state.ai_error_phase = "chunk"
+            return
+        except Exception:
+            st.session_state.ai_source_map_error = "chunk_other"
+            st.session_state.ai_error_phase = "chunk"
+            return
+
+        progress_bar.progress((index + 1) / num_chunks)
+
+    st.session_state.ai_source_map_error = None
+    st.session_state.ai_error_phase = None
+
+    if num_chunks == 1:
+        st.session_state.ai_source_map = convert_single_chunk_to_master(
+            chunk_results[0], filename
+        )
+    else:
+        status_placeholder.write("Combining the section results...")
+        run_combine_step(chunk_results, filename)
+
+
+AI_SOURCE_MAP_ERROR_MESSAGES = {
+    "invalid_key": "The API key was rejected. Check Streamlit Secrets.",
+    "billing": (
+        "The Claude API account may not have enough usage credits. Check "
+        "Anthropic Billing."
+    ),
+    "rate_limited": (
+        "The Claude API is temporarily rate limited. Please wait and "
+        "resume the analysis."
+    ),
+    "invalid_json_chunk": (
+        "Claude responded, but that section could not be read. The "
+        "completed sections were preserved. Try resuming the analysis."
+    ),
+    "chunk_other": (
+        "The AI analysis could not continue. Completed sections were "
+        "preserved when possible."
+    ),
+    "combine_invalid_json": (
+        "The document sections were analyzed, but the final source map "
+        "could not be combined. Retry the combining step."
+    ),
+    "combine_other": (
+        "The AI analysis could not continue. Completed sections were "
+        "preserved when possible."
+    ),
+}
 
 
 st.title("Clinical Scenario Lab")
@@ -515,6 +859,8 @@ if study_file is None:
     st.session_state.pop("study_analysis_file_id", None)
     st.session_state.pop("ai_source_map", None)
     st.session_state.pop("ai_source_map_error", None)
+    st.session_state.pop("ai_error_phase", None)
+    st.session_state.pop("ai_chunk_results", None)
     st.write("No study file uploaded yet.")
 else:
     study_file_bytes = study_file.getvalue()
@@ -528,6 +874,8 @@ else:
         st.session_state.study_analysis_file_id = current_study_file_id
         st.session_state.pop("ai_source_map", None)
         st.session_state.pop("ai_source_map_error", None)
+        st.session_state.pop("ai_error_phase", None)
+        st.session_state.pop("ai_chunk_results", None)
 
     study_file_text = None
     file_extension = study_file.name.rsplit(".", 1)[-1].lower() if "." in study_file.name else ""
@@ -678,90 +1026,84 @@ else:
             st.subheader("AI Study Analysis")
 
             st.write(
-                "Claude will analyze the uploaded study material only when "
-                "you click the button below. This action uses a small "
-                "amount of API credit."
+                "Claude can build a complete AI source map from this "
+                "document by dividing it into sections, analyzing each "
+                "section, and combining the results. Nothing is sent to "
+                "Claude until you confirm and click the button below."
             )
 
             if len(study_file_text) > AI_SOURCE_MAP_CHARACTER_LIMIT:
                 st.write(
-                    "This file is too large for the first AI test. Upload "
-                    "a shorter TXT note containing 8,000 characters or "
-                    "fewer. Full chapter analysis will be added after this "
-                    "test works."
+                    "This file is larger than the current analysis limit. "
+                    "Divide it into smaller study files before creating "
+                    "the AI source map."
                 )
             else:
-                if st.button("Create AI Source Map"):
-                    with st.spinner("Creating the AI source map..."):
-                        try:
-                            client = anthropic.Anthropic(
-                                api_key=st.secrets["ANTHROPIC_API_KEY"]
-                            )
-                            prompt = build_source_map_prompt(
-                                study_file.name, study_file_text
-                            )
-                            response = client.messages.create(
-                                model="claude-sonnet-5",
-                                max_tokens=1500,
-                                messages=[
-                                    {"role": "user", "content": prompt}
-                                ],
-                            )
-                            response_text = "".join(
-                                block.text
-                                for block in response.content
-                                if block.type == "text"
-                            )
-                            st.session_state.ai_source_map = parse_source_map_response(
-                                response_text
-                            )
-                            st.session_state.ai_source_map_error = None
-                        except anthropic.AuthenticationError:
-                            st.session_state.ai_source_map = None
-                            st.session_state.ai_source_map_error = "invalid_key"
-                        except anthropic.PermissionDeniedError:
-                            st.session_state.ai_source_map = None
-                            st.session_state.ai_source_map_error = "billing"
-                        except anthropic.RateLimitError:
-                            st.session_state.ai_source_map = None
-                            st.session_state.ai_source_map_error = "rate_limited"
-                        except (json.JSONDecodeError, ValueError):
-                            st.session_state.ai_source_map = None
-                            st.session_state.ai_source_map_error = "invalid_json"
-                        except Exception:
-                            st.session_state.ai_source_map = None
-                            st.session_state.ai_source_map_error = "other"
+                chunk_plan = chunk_study_text(study_file_text, file_extension)
+                num_chunks = len(chunk_plan)
+                planned_requests = num_chunks + (1 if num_chunks > 1 else 0)
+                word_count = len(study_file_text.split())
 
+                st.write(
+                    f"Extracted material size: {len(study_file_text)} "
+                    f"characters and {word_count} words."
+                )
+                st.write(f"Planned document sections: {num_chunks}")
+                st.write(f"Planned Claude API requests: {planned_requests}")
+                st.write(
+                    "Creating a complete source map will use API credit. "
+                    "No request will be made until you confirm and click "
+                    "the button."
+                )
+
+                confirm_checked = st.checkbox(
+                    "I understand that this analysis will use API credit.",
+                    key="ai_source_map_confirm",
+                )
+
+                if st.session_state.get("ai_chunk_results") is None:
+                    st.session_state.ai_chunk_results = [None] * num_chunks
+
+                if st.button(
+                    "Build Complete AI Source Map", disabled=not confirm_checked
+                ):
+                    st.session_state.ai_chunk_results = [None] * num_chunks
+                    st.session_state.ai_source_map = None
+                    st.session_state.ai_source_map_error = None
+                    st.session_state.ai_error_phase = None
+                    run_chunk_analysis(chunk_plan, study_file.name, 0)
+
+                chunk_results = st.session_state.get("ai_chunk_results") or []
+                completed_count = sum(1 for r in chunk_results if r is not None)
                 ai_source_map_error = st.session_state.get("ai_source_map_error")
+                ai_error_phase = st.session_state.get("ai_error_phase")
 
-                if ai_source_map_error == "invalid_key":
-                    st.error("The API key was rejected. Check Streamlit Secrets.")
-                elif ai_source_map_error == "billing":
-                    st.error(
-                        "The Claude API account may not have enough usage "
-                        "credits. Check Anthropic Billing."
+                if ai_source_map_error:
+                    st.error(AI_SOURCE_MAP_ERROR_MESSAGES[ai_source_map_error])
+
+                if ai_error_phase == "chunk":
+                    st.write(
+                        f"{completed_count} of {num_chunks} sections completed."
                     )
-                elif ai_source_map_error == "rate_limited":
-                    st.error(
-                        "The Claude API is temporarily rate limited. "
-                        "Please wait and try again."
-                    )
-                elif ai_source_map_error == "invalid_json":
-                    st.error(
-                        "Claude responded, but the source map could not be "
-                        "read. Please try the analysis again."
-                    )
-                elif ai_source_map_error == "other":
-                    st.error(
-                        "The AI source map could not be created. Please "
-                        "try again later."
-                    )
+                    if st.button("Resume AI Analysis"):
+                        run_chunk_analysis(
+                            chunk_plan, study_file.name, completed_count
+                        )
+                elif ai_error_phase == "combine":
+                    st.write(f"All {num_chunks} sections completed.")
+                    if st.button("Retry Combining Step"):
+                        run_combine_step(chunk_results, study_file.name)
 
                 source_map = st.session_state.get("ai_source_map")
 
                 if source_map is not None:
-                    st.success("AI source map created successfully.")
-                    st.write(f"Source file: {source_map.get('source_file', '')}")
+                    st.success("Complete AI source map created successfully.")
+                    st.write(f"Source file: {study_file.name}")
+                    st.write(f"Sections analyzed: {num_chunks}")
+                    st.write(
+                        "This source map was generated from the complete "
+                        "extracted study material."
+                    )
 
                     for map_topic in source_map.get("main_topics", []) or []:
                         with st.expander(map_topic.get("topic") or "Untitled topic"):
@@ -778,6 +1120,11 @@ else:
                                 (
                                     "medications_or_treatments",
                                     "Medications or treatments",
+                                ),
+                                ("diagnostics_or_labs", "Diagnostics or labs"),
+                                (
+                                    "delegation_or_escalation",
+                                    "Delegation or escalation",
                                 ),
                                 ("source_evidence", "Source evidence"),
                             ]
@@ -802,17 +1149,25 @@ else:
                                 for item in field_items:
                                     st.write(f"- {item}")
                             else:
-                                st.write("None identified from this uploaded material.")
+                                st.write("None identified from this study material.")
 
                     st.write(
-                        "This source map was generated by Claude from the "
-                        "uploaded material. Review it before using it to "
-                        "build patient scenarios."
+                        "Claude analyzed the uploaded material in sections "
+                        "and combined the results. Review the source map "
+                        "before using it to generate patient scenarios."
                     )
                     st.write(
-                        "Creating the source map uses API credit. Viewing "
-                        "it again during this session does not use "
-                        "additional credit."
+                        "Viewing, expanding, downloading, or using a "
+                        "completed source map during this session does not "
+                        "use additional API credit."
+                    )
+
+                    safe_stem = re.sub(r"[^A-Za-z0-9_-]+", "_", study_file.name.rsplit(".", 1)[0])
+                    st.download_button(
+                        "Download Source Map JSON",
+                        data=json.dumps(source_map, indent=2),
+                        file_name=f"{safe_stem}_source_map.json",
+                        mime="application/json",
                     )
 
 st.write(
