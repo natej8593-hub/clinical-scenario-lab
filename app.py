@@ -464,9 +464,46 @@ TOPIC_KEYWORDS = {
 UPPERCASE_TOKEN_KEYWORDS = {"PAD", "CAD", "DVT", "TIA", "CVA", "INR", "HDL", "LDL"}
 
 
+# Contractions covering the avoidance/negation vocabulary this app needs to
+# recognize (do not, don't, would not, should not, ...), so "don't" and
+# "do not" are treated identically by every matcher downstream.
+CONTRACTION_EXPANSIONS = {
+    r"\bwon't\b": "will not",
+    r"\bshan't\b": "shall not",
+    r"\bdon't\b": "do not",
+    r"\bdoesn't\b": "does not",
+    r"\bdidn't\b": "did not",
+    r"\bisn't\b": "is not",
+    r"\baren't\b": "are not",
+    r"\bwasn't\b": "was not",
+    r"\bweren't\b": "were not",
+    r"\bhasn't\b": "has not",
+    r"\bhaven't\b": "have not",
+    r"\bhadn't\b": "had not",
+    r"\bwouldn't\b": "would not",
+    r"\bshouldn't\b": "should not",
+    r"\bcouldn't\b": "could not",
+    r"\bmustn't\b": "must not",
+    r"\bneedn't\b": "need not",
+    r"\bcan't\b": "cannot",
+}
+
+
+def expand_contractions(text):
+    """Lowercase and expand negation-relevant contractions.
+
+    Curly apostrophes are normalized to straight ones first so "don't"
+    typed with a smart quote expands the same as a straight-quote "don't".
+    """
+    text = text.lower().replace("’", "'")
+    for pattern, expansion in CONTRACTION_EXPANSIONS.items():
+        text = re.sub(pattern, expansion, text)
+    return text
+
+
 def normalize_response_text(text):
-    """Lowercase, strip hyphens/punctuation, and collapse whitespace."""
-    text = text.lower()
+    """Lowercase, expand contractions, strip punctuation, collapse whitespace."""
+    text = expand_contractions(text)
     text = re.sub(r"[^\w\s]", " ", text)
     text = re.sub(r"\s+", " ", text).strip()
     return text
@@ -478,6 +515,157 @@ def has_phrase(padded_text, phrase):
 
 def has_any_phrase(padded_text, phrases):
     return any(has_phrase(padded_text, phrase) for phrase in phrases)
+
+
+# Cue words/phrases (already contraction-expanded and normalized) that
+# signal a response is describing something to avoid rather than do.
+NEGATION_CUES = [
+    "do not",
+    "does not",
+    "did not",
+    "would not",
+    "should not",
+    "could not",
+    "will not",
+    "cannot",
+    "must not",
+    "need not",
+    "never",
+    "avoid",
+    "refrain from",
+    "prevent",
+    "no",
+]
+
+# Purely functional words (plus the negation-cue vocabulary itself)
+# stripped from an authored match phrase to isolate its meaningful content
+# words. Action verbs such as "apply" or "elevate" are deliberately kept
+# because they are what actually needs to be recognized in the response.
+PHRASE_FILLER_WORDS = {
+    "a", "an", "the", "to", "of", "on", "in", "at", "for", "with",
+    "directly", "any", "further", "this", "that", "it", "and", "or",
+    "do", "does", "did", "would", "should", "could", "will", "must",
+    "need", "not", "never", "avoid", "avoiding", "prevent", "preventing",
+    "refrain", "from", "cannot", "can", "no",
+}
+
+CLAUSE_SPLIT_PATTERN = re.compile(
+    r"[.!?;]+|\b(?:but|however|although|whereas|except that)\b"
+)
+
+
+def split_into_clauses(text):
+    """Split raw response text into clause-level chunks for negation scoping.
+
+    A negation word only counts against actions described in the same
+    clause, so "I would not apply heat. I would elevate the leg." does
+    not let the first clause's negation cover the second clause's
+    (unsafe) positive statement.
+    """
+    working_text = expand_contractions(text)
+    raw_clauses = CLAUSE_SPLIT_PATTERN.split(working_text)
+    clauses = []
+    for raw_clause in raw_clauses:
+        cleaned = re.sub(r"[^\w\s]", " ", raw_clause)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        if cleaned:
+            clauses.append(cleaned)
+    return clauses
+
+
+def _content_stem(word):
+    """Loosely normalize a word ending so common verb/noun forms compare equal."""
+    for suffix in ("ations", "ation", "ition", "ing", "ed", "es", "s", "e"):
+        if len(word) - len(suffix) >= 4 and word.endswith(suffix):
+            return word[: -len(suffix)]
+    return word
+
+
+def phrase_core_terms(normalized_phrase):
+    """Return the stemmed content words of an authored match phrase."""
+    words = [w for w in normalized_phrase.split() if w not in PHRASE_FILLER_WORDS]
+    return [_content_stem(w) for w in words]
+
+
+def phrase_expresses_negation(normalized_phrase):
+    padded_phrase = f" {normalized_phrase} "
+    return any(has_phrase(padded_phrase, cue) for cue in NEGATION_CUES)
+
+
+def clause_has_negation_cue(padded_clause):
+    return any(has_phrase(padded_clause, cue) for cue in NEGATION_CUES)
+
+
+def clause_contains_core_terms(padded_clause, core_terms):
+    if not core_terms:
+        return False
+    clause_stems = {_content_stem(word) for word in padded_clause.split()}
+    return all(term in clause_stems for term in core_terms)
+
+
+def phrase_matches_response(phrase, padded_response, clauses):
+    """Recognize one match_any_phrases entry against a nursing response.
+
+    Near-exact wording is matched directly. A phrase that expresses
+    avoidance or negation ("avoid...", "do not...", "never...") is also
+    recognized when a single clause of the response contains both a
+    negation cue and the phrase's core content words — so equivalent
+    phrasing such as "I would not apply heat" or "don't use a heating
+    pad" is recognized without needing that exact wording. Because the
+    negation cue must be present in that same clause, an unsafe positive
+    statement like "apply a heating pad" is never mistaken for successful
+    avoidance. Phrases that do not express negation use the same
+    core-word check without requiring a cue, so minor rewording of a
+    plain positive phrase (extra or reordered words) is still recognized.
+    """
+    normalized_phrase = normalize_response_text(phrase)
+    if not normalized_phrase:
+        return False
+
+    if has_phrase(padded_response, normalized_phrase):
+        return True
+
+    core_terms = phrase_core_terms(normalized_phrase)
+    if not core_terms:
+        return False
+
+    negation_phrase = phrase_expresses_negation(normalized_phrase)
+
+    for clause in clauses:
+        padded_clause = f" {clause} "
+        if negation_phrase and not clause_has_negation_cue(padded_clause):
+            continue
+        if clause_contains_core_terms(padded_clause, core_terms):
+            return True
+
+    return False
+
+
+def keyword_matches_response(keyword, padded_response, clauses):
+    """Recognize one match_all_keyword_groups entry against a response.
+
+    Literal matches are checked first. A keyword that is itself a
+    negation cue (e.g. "avoid") also matches any other negation cue
+    ("never", "do not", ...) so keyword groups are not sensitive to
+    which specific negation wording the scenario author picked. Other
+    keywords fall back to a stemmed match so verb forms like "elevate"
+    and "elevating" are treated the same.
+    """
+    normalized_keyword = normalize_response_text(keyword)
+    if not normalized_keyword:
+        return False
+
+    if has_phrase(padded_response, normalized_keyword):
+        return True
+
+    if normalized_keyword in NEGATION_CUES:
+        return any(clause_has_negation_cue(f" {clause} ") for clause in clauses)
+
+    keyword_stem = _content_stem(normalized_keyword)
+    return any(
+        keyword_stem in {_content_stem(word) for word in clause.split()}
+        for clause in clauses
+    )
 
 
 def detect_study_topics(text):
@@ -1398,18 +1586,25 @@ def run_scenario_generation(prompt):
     reset_generated_scenario_progress()
 
 
-def match_critical_action(padded_response, action):
-    """Recognize a critical action via any phrase or a full keyword group."""
-    phrases = [
-        normalize_response_text(phrase)
-        for phrase in (action.get("match_any_phrases") or [])
-    ]
-    if has_any_phrase(padded_response, phrases):
-        return True
+def match_critical_action(nursing_response_raw, padded_response, action):
+    """Recognize a critical action via any phrase or a full keyword group.
+
+    Understands avoidance/negation phrasing (see phrase_matches_response)
+    so natural variations of an "avoid X" critical action are recognized
+    without requiring literal wording, while never crediting an unsafe
+    positive statement as successful avoidance.
+    """
+    clauses = split_into_clauses(nursing_response_raw)
+
+    for phrase in action.get("match_any_phrases") or []:
+        if phrase_matches_response(phrase, padded_response, clauses):
+            return True
 
     for group in action.get("match_all_keyword_groups") or []:
-        keywords = [normalize_response_text(keyword) for keyword in group]
-        if keywords and all(has_phrase(padded_response, keyword) for keyword in keywords):
+        if group and all(
+            keyword_matches_response(keyword, padded_response, clauses)
+            for keyword in group
+        ):
             return True
 
     return False
@@ -1437,69 +1632,110 @@ def render_generated_scenario_stage(scenario, stage_number):
     if stage.get("question"):
         st.write(stage["question"])
 
-    response_key = f"gs_stage{stage_number}_response_box"
-    nursing_response = st.text_area("Type your nursing response", key=response_key)
-
-    if st.button("Submit Nursing Action", key=f"gs_stage{stage_number}_submit"):
-        if nursing_response.strip() == "":
-            st.write("Please enter a response before submitting.")
-        else:
-            normalized_response = normalize_response_text(nursing_response)
-            padded_response = f" {normalized_response} "
-            critical_actions = stage.get("critical_actions") or []
-            recognized = [
-                action
-                for action in critical_actions
-                if match_critical_action(padded_response, action)
-            ]
-            missing = [
-                action for action in critical_actions if action not in recognized
-            ]
-            st.session_state.gs_stage_data[stage_number] = {
-                "response": nursing_response,
-                "recognized": recognized,
-                "missing": missing,
-            }
-
     stage_data = st.session_state.gs_stage_data.get(stage_number)
-    if stage_data is not None:
-        st.write("Your response:")
-        st.write(stage_data["response"])
+    needs_editor = stage_data is None or stage_data.get("revising")
 
-        for action in stage_data["recognized"]:
-            st.write(f"✅ {action.get('display_name')}")
-            if action.get("rationale"):
-                st.write(action["rationale"])
-            for evidence in action.get("source_evidence") or []:
-                st.write(f"- {evidence}")
+    if needs_editor:
+        response_key = f"gs_stage{stage_number}_response_box"
+        if response_key not in st.session_state:
+            st.session_state[response_key] = stage_data["response"] if stage_data else ""
 
-        for action in stage_data["missing"]:
-            st.write(f"⚠️ Consider: {action.get('display_name')}")
-            if action.get("rationale"):
-                st.write(action["rationale"])
-            for evidence in action.get("source_evidence") or []:
-                st.write(f"- {evidence}")
+        nursing_response = st.text_area("Type your nursing response", key=response_key)
 
-        recognized_count = len(stage_data["recognized"])
-        minimum_needed = stage.get("minimum_actions_to_continue", 1)
+        if st.button("Submit Nursing Action", key=f"gs_stage{stage_number}_submit"):
+            if nursing_response.strip() == "":
+                st.write("Please enter a response before submitting.")
+            else:
+                normalized_response = normalize_response_text(nursing_response)
+                padded_response = f" {normalized_response} "
+                critical_actions = stage.get("critical_actions") or []
+                recognized = [
+                    action
+                    for action in critical_actions
+                    if match_critical_action(nursing_response, padded_response, action)
+                ]
+                missing = [
+                    action for action in critical_actions if action not in recognized
+                ]
+                st.session_state.gs_stage_data[stage_number] = {
+                    "response": nursing_response,
+                    "recognized": recognized,
+                    "missing": missing,
+                    "revising": False,
+                    "continued_with_incomplete": False,
+                }
+                st.rerun()
+        return
 
-        if recognized_count >= minimum_needed:
-            if stage.get("patient_update_if_successful"):
-                st.write(stage["patient_update_if_successful"])
-        else:
-            if stage.get("patient_update_if_incomplete"):
-                st.write(stage["patient_update_if_incomplete"])
+    st.write("Your response:")
+    st.write(stage_data["response"])
 
-        if stage_number < len(scenario["stages"]):
-            if recognized_count >= minimum_needed:
-                if st.button(
-                    "Continue Scenario", key=f"gs_stage{stage_number}_continue"
-                ):
-                    st.session_state.gs_current_stage = stage_number + 1
-        else:
-            if recognized_count >= minimum_needed:
-                if st.button("View Generated Scenario Debrief", key="gs_view_debrief"):
-                    st.session_state.gs_show_debrief = True
+    for action in stage_data["recognized"]:
+        st.write(f"✅ {action.get('display_name')}")
+        if action.get("rationale"):
+            st.write(action["rationale"])
+        for evidence in action.get("source_evidence") or []:
+            st.write(f"- {evidence}")
+
+    for action in stage_data["missing"]:
+        st.write(f"⚠️ Consider: {action.get('display_name')}")
+        if action.get("rationale"):
+            st.write(action["rationale"])
+        for evidence in action.get("source_evidence") or []:
+            st.write(f"- {evidence}")
+
+    recognized_count = len(stage_data["recognized"])
+    minimum_needed = stage.get("minimum_actions_to_continue", 1)
+    met_threshold = recognized_count >= minimum_needed
+
+    if met_threshold:
+        if stage.get("patient_update_if_successful"):
+            st.write(stage["patient_update_if_successful"])
+    else:
+        if stage.get("patient_update_if_incomplete"):
+            st.write(stage["patient_update_if_incomplete"])
+        if stage_data.get("continued_with_incomplete"):
+            st.info(
+                "This stage continued with incomplete priorities. The "
+                "outcome above reflects the actions that were missed."
+            )
+
+    is_active_stage = st.session_state.gs_current_stage == stage_number
+    is_final_stage = stage_number == len(scenario["stages"])
+
+    if not is_active_stage:
+        return
+
+    if is_final_stage:
+        if not met_threshold:
+            if st.button(
+                "Revise Nursing Response", key=f"gs_stage{stage_number}_revise"
+            ):
+                st.session_state.gs_stage_data[stage_number]["revising"] = True
+                st.rerun()
+        if st.button("View Generated Scenario Debrief", key="gs_view_debrief"):
+            st.session_state.gs_show_debrief = True
+        return
+
+    if met_threshold or stage_data.get("continued_with_incomplete"):
+        if st.button("Continue Scenario", key=f"gs_stage{stage_number}_continue"):
+            st.session_state.gs_current_stage = stage_number + 1
+            st.rerun()
+        return
+
+    revise_col, continue_col = st.columns(2)
+    with revise_col:
+        if st.button("Revise Nursing Response", key=f"gs_stage{stage_number}_revise"):
+            st.session_state.gs_stage_data[stage_number]["revising"] = True
+            st.rerun()
+    with continue_col:
+        if st.button(
+            "Continue With Current Outcome",
+            key=f"gs_stage{stage_number}_continue_incomplete",
+        ):
+            st.session_state.gs_stage_data[stage_number]["continued_with_incomplete"] = True
+            st.session_state.gs_current_stage = stage_number + 1
+            st.rerun()
 
 
 def render_generated_scenario_debrief(scenario):
@@ -1518,6 +1754,14 @@ def render_generated_scenario_debrief(scenario):
         "recognized": [],
         "missing": [],
     }
+
+    if stage1_data.get("continued_with_incomplete"):
+        st.write(
+            "Stage 1 moved forward to Stage 2 before every initial priority "
+            "was addressed. The timeline below reflects the actions that "
+            "were completed and the ones that were still pending when the "
+            "scenario continued."
+        )
 
     st.subheader("Actions Recognized in Stage 1")
     for action in stage1_data["recognized"]:
@@ -2267,10 +2511,23 @@ if "gs_stage_data" not in st.session_state:
 if "gs_show_debrief" not in st.session_state:
     st.session_state.gs_show_debrief = False
 
-if st.session_state.gs_started and st.session_state.get("generated_scenario") is not None:
+generated_scenario_active = (
+    st.session_state.gs_started
+    and st.session_state.get("generated_scenario") is not None
+)
+
+if generated_scenario_active:
     generated_scenario = st.session_state.generated_scenario
 
     st.header(generated_scenario.get("scenario_title") or "Generated Patient Scenario")
+
+    st.write(
+        "The built-in nursing-topic scenario below is hidden while this "
+        "generated scenario is active."
+    )
+    if st.button("Exit Generated Scenario", key="gs_exit_btn"):
+        reset_generated_scenario_progress()
+        st.rerun()
 
     learning_objectives = generated_scenario.get("learning_objectives") or []
     if learning_objectives:
@@ -2296,331 +2553,332 @@ if st.session_state.gs_started and st.session_state.get("generated_scenario") is
     if st.session_state.gs_show_debrief:
         render_generated_scenario_debrief(generated_scenario)
 
-if "topic_select" not in st.session_state:
-    st.session_state.topic_select = "Hypertensive Emergency"
+if not generated_scenario_active:
+    if "topic_select" not in st.session_state:
+        st.session_state.topic_select = "Hypertensive Emergency"
 
-topic = st.selectbox(
-    "Choose a nursing topic",
-    ["Hypertensive Emergency", "Peripheral Arterial Disease", "Deep Vein Thrombosis"],
-    key="topic_select",
-)
+    topic = st.selectbox(
+        "Choose a nursing topic",
+        ["Hypertensive Emergency", "Peripheral Arterial Disease", "Deep Vein Thrombosis"],
+        key="topic_select",
+    )
 
-if "scenario_started" not in st.session_state:
-    st.session_state.scenario_started = False
+    if "scenario_started" not in st.session_state:
+        st.session_state.scenario_started = False
 
-if st.button("Start Scenario"):
-    st.session_state.scenario_started = True
-    st.session_state.he_submitted_action = None
-    st.session_state.he_stage2_active = False
-    st.session_state.he_submitted_second_action = None
-    st.session_state.he_show_debrief = False
-    st.session_state.pop("he_first_action_box", None)
-    st.session_state.pop("he_second_action_box", None)
-    st.session_state.he_loaded_from_detection = False
-    st.session_state.pop("he_detected_source_file", None)
+    if st.button("Start Scenario"):
+        st.session_state.scenario_started = True
+        st.session_state.he_submitted_action = None
+        st.session_state.he_stage2_active = False
+        st.session_state.he_submitted_second_action = None
+        st.session_state.he_show_debrief = False
+        st.session_state.pop("he_first_action_box", None)
+        st.session_state.pop("he_second_action_box", None)
+        st.session_state.he_loaded_from_detection = False
+        st.session_state.pop("he_detected_source_file", None)
 
-if st.session_state.scenario_started:
-    if topic == "Hypertensive Emergency":
-        if st.session_state.get("he_loaded_from_detection") and st.session_state.get(
-            "he_detected_source_file"
-        ):
-            st.write("Source connection:")
+    if st.session_state.scenario_started:
+        if topic == "Hypertensive Emergency":
+            if st.session_state.get("he_loaded_from_detection") and st.session_state.get(
+                "he_detected_source_file"
+            ):
+                st.write("Source connection:")
+                st.write(
+                    "This built-in practice scenario was selected because "
+                    "Hypertensive Emergency was detected in "
+                    f"{st.session_state.he_detected_source_file}."
+                )
+
+            st.header("Patient Handoff")
+
             st.write(
-                "This built-in practice scenario was selected because "
-                "Hypertensive Emergency was detected in "
-                f"{st.session_state.he_detected_source_file}."
+                "Mr. Jones is a 68-year-old patient admitted for uncontrolled "
+                "hypertension. He suddenly reports a severe headache and blurred vision."
             )
 
-        st.header("Patient Handoff")
+            st.subheader("Vital signs")
+            st.write("- Blood pressure: 214/122 mm Hg")
+            st.write("- Heart rate: 94 beats/min")
+            st.write("- Respiratory rate: 22 breaths/min")
+            st.write("- Oxygen saturation: 96% on room air")
 
-        st.write(
-            "Mr. Jones is a 68-year-old patient admitted for uncontrolled "
-            "hypertension. He suddenly reports a severe headache and blurred vision."
-        )
+            st.write("What would you assess or do first?")
 
-        st.subheader("Vital signs")
-        st.write("- Blood pressure: 214/122 mm Hg")
-        st.write("- Heart rate: 94 beats/min")
-        st.write("- Respiratory rate: 22 breaths/min")
-        st.write("- Oxygen saturation: 96% on room air")
+            nursing_action = st.text_area("Type your nursing action", key="he_first_action_box")
 
-        st.write("What would you assess or do first?")
-
-        nursing_action = st.text_area("Type your nursing action", key="he_first_action_box")
-
-        if "he_submitted_action" not in st.session_state:
-            st.session_state.he_submitted_action = None
-
-        if "he_stage2_active" not in st.session_state:
-            st.session_state.he_stage2_active = False
-
-        if "he_submitted_second_action" not in st.session_state:
-            st.session_state.he_submitted_second_action = None
-
-        if "he_show_debrief" not in st.session_state:
-            st.session_state.he_show_debrief = False
-
-        if st.button("Submit Action"):
-            if nursing_action.strip() == "":
+            if "he_submitted_action" not in st.session_state:
                 st.session_state.he_submitted_action = None
-                st.write("Please enter an action before submitting.")
-            else:
-                st.session_state.he_submitted_action = nursing_action
 
-        if st.session_state.he_submitted_action:
-            submitted_action = st.session_state.he_submitted_action
+            if "he_stage2_active" not in st.session_state:
+                st.session_state.he_stage2_active = False
 
-            normalized_response = normalize_response_text(submitted_action)
-            padded_response = f" {normalized_response} "
+            if "he_submitted_second_action" not in st.session_state:
+                st.session_state.he_submitted_second_action = None
 
-            st.write("Your action was recorded.")
-            st.write(f"You entered: {submitted_action}")
+            if "he_show_debrief" not in st.session_state:
+                st.session_state.he_show_debrief = False
 
-            st.header("Initial Nursing Priorities")
-
-            priority_categories = compute_stage1_categories(padded_response)
-
-            recognized_count = 0
-
-            for category_name, recognized in priority_categories:
-                if recognized:
-                    recognized_count += 1
-                    st.write(f"✅ {category_name}")
-                else:
-                    st.write(f"⚠️ Consider: {category_name}")
-
-            if recognized_count >= 3:
-                st.write("Strong initial response. You recognized several immediate priorities.")
-            else:
-                st.write("Review the missing priorities before continuing.")
-
-            st.write(
-                "Blood pressure above 180/120 mm Hg with new neurological symptoms "
-                "suggests a hypertensive emergency with possible target-organ damage."
-            )
-
-            if recognized_count >= 3:
-                if st.button("Continue Scenario"):
-                    st.session_state.he_stage2_active = True
-
-        if st.session_state.he_stage2_active:
-            st.header("Patient Update — 3 Minutes Later")
-
-            st.write(
-                "The repeat manual blood pressure is 218/124 mm Hg. Mr. Jones is now "
-                "confused and has developed slurred speech, left-sided facial "
-                "drooping, and weakness in his left arm. His oxygen saturation "
-                "remains 96% on room air. His airway is currently open, and he is "
-                "breathing without assistance."
-            )
-
-            st.subheader("Last known well")
-            st.write(
-                "Mr. Jones was speaking normally and moving all extremities "
-                "approximately 10 minutes ago."
-            )
-
-            st.write("What would you assess or do next?")
-
-            second_action = st.text_area(
-                "Type your next nursing action", key="he_second_action_box"
-            )
-
-            if st.button("Submit Next Action"):
-                if second_action.strip() == "":
-                    st.session_state.he_submitted_second_action = None
+            if st.button("Submit Action"):
+                if nursing_action.strip() == "":
+                    st.session_state.he_submitted_action = None
                     st.write("Please enter an action before submitting.")
                 else:
-                    st.session_state.he_submitted_second_action = second_action
+                    st.session_state.he_submitted_action = nursing_action
 
-            if st.session_state.he_submitted_second_action:
-                submitted_second_action = st.session_state.he_submitted_second_action
+            if st.session_state.he_submitted_action:
+                submitted_action = st.session_state.he_submitted_action
 
-                normalized_second_response = normalize_response_text(submitted_second_action)
-                padded_second_response = f" {normalized_second_response} "
+                normalized_response = normalize_response_text(submitted_action)
+                padded_response = f" {normalized_response} "
 
-                st.write("Your second action was recorded.")
-                st.write("You entered:")
-                st.write(submitted_second_action)
+                st.write("Your action was recorded.")
+                st.write(f"You entered: {submitted_action}")
 
-                st.header("Second-Stage Nursing Priorities")
+                st.header("Initial Nursing Priorities")
 
-                second_stage_categories = compute_stage2_categories(padded_second_response)
+                priority_categories = compute_stage1_categories(padded_response)
 
-                second_stage_recognized_count = 0
+                recognized_count = 0
 
-                for category_name, recognized in second_stage_categories:
+                for category_name, recognized in priority_categories:
                     if recognized:
-                        second_stage_recognized_count += 1
+                        recognized_count += 1
                         st.write(f"✅ {category_name}")
                     else:
                         st.write(f"⚠️ Consider: {category_name}")
 
-                if second_stage_recognized_count >= 5:
-                    st.write(
-                        "Strong next response. You recognized the major "
-                        "time-sensitive stroke priorities."
-                    )
-                elif second_stage_recognized_count >= 3:
-                    st.write(
-                        "You recognized several priorities, but review the "
-                        "missing time-sensitive actions."
-                    )
+                if recognized_count >= 3:
+                    st.write("Strong initial response. You recognized several immediate priorities.")
                 else:
-                    st.write("Review the missing priorities before the scenario continues.")
+                    st.write("Review the missing priorities before continuing.")
 
                 st.write(
-                    "Sudden facial drooping, unilateral weakness, slurred speech, "
-                    "and confusion require an immediate stroke response. The "
-                    "last-known-well time helps guide time-sensitive treatment "
-                    "decisions. Bedside glucose checks for a possible stroke "
-                    "mimic, and urgent brain imaging helps determine whether "
-                    "bleeding is present. Keep the patient NPO until swallowing "
-                    "safety is evaluated."
+                    "Blood pressure above 180/120 mm Hg with new neurological symptoms "
+                    "suggests a hypertensive emergency with possible target-organ damage."
                 )
+
+                if recognized_count >= 3:
+                    if st.button("Continue Scenario"):
+                        st.session_state.he_stage2_active = True
+
+            if st.session_state.he_stage2_active:
+                st.header("Patient Update — 3 Minutes Later")
 
                 st.write(
-                    "The nurse should continue monitoring airway, breathing, "
-                    "circulation, vital signs, and neurological status while "
-                    "following the facility's stroke protocol."
+                    "The repeat manual blood pressure is 218/124 mm Hg. Mr. Jones is now "
+                    "confused and has developed slurred speech, left-sided facial "
+                    "drooping, and weakness in his left arm. His oxygen saturation "
+                    "remains 96% on room air. His airway is currently open, and he is "
+                    "breathing without assistance."
                 )
 
-                if st.button("View Final Debrief"):
-                    st.session_state.he_show_debrief = True
+                st.subheader("Last known well")
+                st.write(
+                    "Mr. Jones was speaking normally and moving all extremities "
+                    "approximately 10 minutes ago."
+                )
 
-                if st.session_state.he_show_debrief:
-                    stage1_padded_response = (
-                        f" {normalize_response_text(st.session_state.he_submitted_action)} "
-                    )
-                    stage1_categories = compute_stage1_categories(stage1_padded_response)
+                st.write("What would you assess or do next?")
 
-                    stage1_recognized = [
-                        name for name, recognized in stage1_categories if recognized
-                    ]
-                    stage1_missing = [
-                        name for name, recognized in stage1_categories if not recognized
-                    ]
-                    stage2_recognized = [
-                        name for name, recognized in second_stage_categories if recognized
-                    ]
-                    stage2_missing = [
-                        name for name, recognized in second_stage_categories if not recognized
-                    ]
+                second_action = st.text_area(
+                    "Type your next nursing action", key="he_second_action_box"
+                )
 
-                    st.header("Scenario Debrief")
-
-                    st.subheader("Patient Outcome")
-                    st.write(
-                        "The stroke response was activated, Mr. Jones remained NPO, "
-                        "bedside glucose was checked, and he was transported for "
-                        "urgent brain imaging while neurological status and vital "
-                        "signs were continuously monitored. The scenario ends here "
-                        "because further treatment depends on imaging results, "
-                        "provider orders, facility protocols, and the patient's "
-                        "eligibility for specific therapies."
-                    )
-
-                    st.subheader("What You Recognized")
-                    st.write("Initial response")
-                    for name in stage1_recognized:
-                        st.write(f"✅ {name}")
-                    st.write("Second response")
-                    for name in stage2_recognized:
-                        st.write(f"✅ {name}")
-
-                    st.subheader("Priorities to Review")
-                    if stage1_missing or stage2_missing:
-                        if stage1_missing:
-                            st.write("Initial response")
-                            for name in stage1_missing:
-                                st.write(f"⚠️ {name}")
-                        if stage2_missing:
-                            st.write("Second response")
-                            for name in stage2_missing:
-                                st.write(f"⚠️ {name}")
-                    else:
-                        st.write("You recognized every priority included in this scenario.")
-
-                    st.subheader("Ideal Nursing Sequence")
-                    st.markdown(
-                        "1. Verify the severely elevated blood pressure and perform "
-                        "an immediate focused assessment.\n"
-                        "2. Begin continuous monitoring and rapidly escalate care "
-                        "because neurological symptoms suggest target-organ damage.\n"
-                        "3. Recognize the new facial drooping, unilateral weakness, "
-                        "slurred speech, and confusion as an acute stroke warning.\n"
-                        "4. Activate the facility's stroke response and communicate "
-                        "the last-known-well time.\n"
-                        "5. Perform focused neurological checks and obtain bedside "
-                        "blood glucose.\n"
-                        "6. Keep the patient NPO and protect airway, swallowing, and "
-                        "general safety.\n"
-                        "7. Prepare for urgent brain imaging while continuing airway, "
-                        "breathing, circulation, vital-sign, and neurological "
-                        "monitoring.\n"
-                        "8. Follow provider orders and the facility's stroke "
-                        "protocol after imaging results are available."
-                    )
-
-                    st.subheader("Why This Situation Was Dangerous")
-                    st.write(
-                        "A blood pressure above 180/120 mm Hg with new neurological "
-                        "findings represents a hypertensive emergency because acute "
-                        "target-organ damage may be occurring. Sudden facial "
-                        "drooping, arm weakness, slurred speech, and confusion are "
-                        "time-sensitive stroke warning signs. Delayed recognition or "
-                        "escalation can delay imaging and treatment and may worsen "
-                        "neurological injury."
-                    )
-
-                    st.subheader("Example SBAR")
-                    st.markdown("**Situation:**")
-                    st.write(
-                        "Mr. Jones is a 68-year-old patient admitted with "
-                        "uncontrolled hypertension. His repeat manual blood "
-                        "pressure is 218/124 mm Hg, and he has developed sudden "
-                        "confusion, slurred speech, left facial drooping, and left "
-                        "arm weakness."
-                    )
-                    st.markdown("**Background:**")
-                    st.write(
-                        "He was speaking normally and moving all extremities "
-                        "approximately 10 minutes ago. His oxygen saturation is 96% "
-                        "on room air, and his airway is currently open."
-                    )
-                    st.markdown("**Assessment:**")
-                    st.write(
-                        "This is an acute neurological change concerning for "
-                        "stroke during a hypertensive emergency. A focused "
-                        "neurological assessment is being completed, bedside "
-                        "glucose is being obtained, and he is being kept NPO with "
-                        "continuous monitoring."
-                    )
-                    st.markdown("**Recommendation:**")
-                    st.write(
-                        "Activate the facility's stroke protocol immediately, "
-                        "evaluate him urgently, and prepare for emergency brain "
-                        "imaging and additional provider-directed treatment."
-                    )
-
-                    st.write(
-                        "This debrief is for education only. Actual nursing "
-                        "actions must follow the patient's condition, provider "
-                        "orders, facility policy, emergency protocols, "
-                        "supervision, and legal scope of practice."
-                    )
-
-                    if st.button("Restart Scenario"):
-                        st.session_state.scenario_started = False
-                        st.session_state.he_submitted_action = None
-                        st.session_state.he_stage2_active = False
+                if st.button("Submit Next Action"):
+                    if second_action.strip() == "":
                         st.session_state.he_submitted_second_action = None
-                        st.session_state.he_show_debrief = False
-                        st.session_state.pop("he_first_action_box", None)
-                        st.session_state.pop("he_second_action_box", None)
-                        st.session_state.he_loaded_from_detection = False
-                        st.session_state.pop("he_detected_source_file", None)
-                        st.rerun()
-    else:
-        st.write(f"You selected: {topic}")
-        st.write("The interactive patient scenario for this topic will be added later.")
+                        st.write("Please enter an action before submitting.")
+                    else:
+                        st.session_state.he_submitted_second_action = second_action
+
+                if st.session_state.he_submitted_second_action:
+                    submitted_second_action = st.session_state.he_submitted_second_action
+
+                    normalized_second_response = normalize_response_text(submitted_second_action)
+                    padded_second_response = f" {normalized_second_response} "
+
+                    st.write("Your second action was recorded.")
+                    st.write("You entered:")
+                    st.write(submitted_second_action)
+
+                    st.header("Second-Stage Nursing Priorities")
+
+                    second_stage_categories = compute_stage2_categories(padded_second_response)
+
+                    second_stage_recognized_count = 0
+
+                    for category_name, recognized in second_stage_categories:
+                        if recognized:
+                            second_stage_recognized_count += 1
+                            st.write(f"✅ {category_name}")
+                        else:
+                            st.write(f"⚠️ Consider: {category_name}")
+
+                    if second_stage_recognized_count >= 5:
+                        st.write(
+                            "Strong next response. You recognized the major "
+                            "time-sensitive stroke priorities."
+                        )
+                    elif second_stage_recognized_count >= 3:
+                        st.write(
+                            "You recognized several priorities, but review the "
+                            "missing time-sensitive actions."
+                        )
+                    else:
+                        st.write("Review the missing priorities before the scenario continues.")
+
+                    st.write(
+                        "Sudden facial drooping, unilateral weakness, slurred speech, "
+                        "and confusion require an immediate stroke response. The "
+                        "last-known-well time helps guide time-sensitive treatment "
+                        "decisions. Bedside glucose checks for a possible stroke "
+                        "mimic, and urgent brain imaging helps determine whether "
+                        "bleeding is present. Keep the patient NPO until swallowing "
+                        "safety is evaluated."
+                    )
+
+                    st.write(
+                        "The nurse should continue monitoring airway, breathing, "
+                        "circulation, vital signs, and neurological status while "
+                        "following the facility's stroke protocol."
+                    )
+
+                    if st.button("View Final Debrief"):
+                        st.session_state.he_show_debrief = True
+
+                    if st.session_state.he_show_debrief:
+                        stage1_padded_response = (
+                            f" {normalize_response_text(st.session_state.he_submitted_action)} "
+                        )
+                        stage1_categories = compute_stage1_categories(stage1_padded_response)
+
+                        stage1_recognized = [
+                            name for name, recognized in stage1_categories if recognized
+                        ]
+                        stage1_missing = [
+                            name for name, recognized in stage1_categories if not recognized
+                        ]
+                        stage2_recognized = [
+                            name for name, recognized in second_stage_categories if recognized
+                        ]
+                        stage2_missing = [
+                            name for name, recognized in second_stage_categories if not recognized
+                        ]
+
+                        st.header("Scenario Debrief")
+
+                        st.subheader("Patient Outcome")
+                        st.write(
+                            "The stroke response was activated, Mr. Jones remained NPO, "
+                            "bedside glucose was checked, and he was transported for "
+                            "urgent brain imaging while neurological status and vital "
+                            "signs were continuously monitored. The scenario ends here "
+                            "because further treatment depends on imaging results, "
+                            "provider orders, facility protocols, and the patient's "
+                            "eligibility for specific therapies."
+                        )
+
+                        st.subheader("What You Recognized")
+                        st.write("Initial response")
+                        for name in stage1_recognized:
+                            st.write(f"✅ {name}")
+                        st.write("Second response")
+                        for name in stage2_recognized:
+                            st.write(f"✅ {name}")
+
+                        st.subheader("Priorities to Review")
+                        if stage1_missing or stage2_missing:
+                            if stage1_missing:
+                                st.write("Initial response")
+                                for name in stage1_missing:
+                                    st.write(f"⚠️ {name}")
+                            if stage2_missing:
+                                st.write("Second response")
+                                for name in stage2_missing:
+                                    st.write(f"⚠️ {name}")
+                        else:
+                            st.write("You recognized every priority included in this scenario.")
+
+                        st.subheader("Ideal Nursing Sequence")
+                        st.markdown(
+                            "1. Verify the severely elevated blood pressure and perform "
+                            "an immediate focused assessment.\n"
+                            "2. Begin continuous monitoring and rapidly escalate care "
+                            "because neurological symptoms suggest target-organ damage.\n"
+                            "3. Recognize the new facial drooping, unilateral weakness, "
+                            "slurred speech, and confusion as an acute stroke warning.\n"
+                            "4. Activate the facility's stroke response and communicate "
+                            "the last-known-well time.\n"
+                            "5. Perform focused neurological checks and obtain bedside "
+                            "blood glucose.\n"
+                            "6. Keep the patient NPO and protect airway, swallowing, and "
+                            "general safety.\n"
+                            "7. Prepare for urgent brain imaging while continuing airway, "
+                            "breathing, circulation, vital-sign, and neurological "
+                            "monitoring.\n"
+                            "8. Follow provider orders and the facility's stroke "
+                            "protocol after imaging results are available."
+                        )
+
+                        st.subheader("Why This Situation Was Dangerous")
+                        st.write(
+                            "A blood pressure above 180/120 mm Hg with new neurological "
+                            "findings represents a hypertensive emergency because acute "
+                            "target-organ damage may be occurring. Sudden facial "
+                            "drooping, arm weakness, slurred speech, and confusion are "
+                            "time-sensitive stroke warning signs. Delayed recognition or "
+                            "escalation can delay imaging and treatment and may worsen "
+                            "neurological injury."
+                        )
+
+                        st.subheader("Example SBAR")
+                        st.markdown("**Situation:**")
+                        st.write(
+                            "Mr. Jones is a 68-year-old patient admitted with "
+                            "uncontrolled hypertension. His repeat manual blood "
+                            "pressure is 218/124 mm Hg, and he has developed sudden "
+                            "confusion, slurred speech, left facial drooping, and left "
+                            "arm weakness."
+                        )
+                        st.markdown("**Background:**")
+                        st.write(
+                            "He was speaking normally and moving all extremities "
+                            "approximately 10 minutes ago. His oxygen saturation is 96% "
+                            "on room air, and his airway is currently open."
+                        )
+                        st.markdown("**Assessment:**")
+                        st.write(
+                            "This is an acute neurological change concerning for "
+                            "stroke during a hypertensive emergency. A focused "
+                            "neurological assessment is being completed, bedside "
+                            "glucose is being obtained, and he is being kept NPO with "
+                            "continuous monitoring."
+                        )
+                        st.markdown("**Recommendation:**")
+                        st.write(
+                            "Activate the facility's stroke protocol immediately, "
+                            "evaluate him urgently, and prepare for emergency brain "
+                            "imaging and additional provider-directed treatment."
+                        )
+
+                        st.write(
+                            "This debrief is for education only. Actual nursing "
+                            "actions must follow the patient's condition, provider "
+                            "orders, facility policy, emergency protocols, "
+                            "supervision, and legal scope of practice."
+                        )
+
+                        if st.button("Restart Scenario"):
+                            st.session_state.scenario_started = False
+                            st.session_state.he_submitted_action = None
+                            st.session_state.he_stage2_active = False
+                            st.session_state.he_submitted_second_action = None
+                            st.session_state.he_show_debrief = False
+                            st.session_state.pop("he_first_action_box", None)
+                            st.session_state.pop("he_second_action_box", None)
+                            st.session_state.he_loaded_from_detection = False
+                            st.session_state.pop("he_detected_source_file", None)
+                            st.rerun()
+        else:
+            st.write(f"You selected: {topic}")
+            st.write("The interactive patient scenario for this topic will be added later.")
